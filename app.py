@@ -13,12 +13,10 @@ from urllib.parse import unquote
 # =============================================================
 
 if not st.user.is_logged_in:
-
-    st.login("google")
-
-
-if not st.user.is_logged_in:
-
+    st.button(
+        "🔵 Sign in with Google",
+        on_click=st.login
+    )
     st.stop()
 
 
