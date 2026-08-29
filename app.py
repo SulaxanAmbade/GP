@@ -9,63 +9,6 @@ from urllib.parse import unquote
 
 
 # =============================================================
-# GOOGLE AUTHENTICATION
-# =============================================================
-
-if not st.user.is_logged_in:
-    st.button(
-        "🔵 Sign in with Google",
-        on_click=st.login
-    )
-    st.stop()
-
-
-# =============================================================
-# USER ACCESS CONTROL
-# =============================================================
-
-user_email = (
-    st.user.email
-    .lower()
-    .strip()
-)
-
-
-allowed_users = [
-    email.lower().strip()
-    for email in st.secrets["ALLOWED_USERS"]
-]
-
-
-if user_email not in allowed_users:
-
-    st.error(
-        "🚫 Access denied."
-    )
-
-    st.write(
-        f"The Google account `{user_email}` "
-        "is not authorized to use this application."
-    )
-
-    st.stop()
-
-
-# =============================================================
-# AUTHORIZED USER
-# =============================================================
-
-st.sidebar.success(
-    f"Signed in as {user_email}"
-)
-
-if st.button(
-    "Sign out",
-    key="logout_button"
-):
-
-    st.logout()
-# =============================================================
 # PAGE CONFIGURATION
 # =============================================================
 
