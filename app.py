@@ -2253,6 +2253,7 @@ def concatenate_sheet_page():
                     results.append(
                         f"*{domain}*{b}*"
                     )
+                    break
 
             result_text = "\n".join(
                 results
