@@ -2245,16 +2245,8 @@ def concatenate_sheet_page():
             # =================================================
             # EVERY DOMAIN × EVERY BASIS
             # =================================================
-
-            for domain in domains:
-
-                for i in range(len(basis)):
-
-                    results.append(
-                        f"*{domain}*{basis[i]}*"
-                    )
-                    i+=1
-                    break
+            for domain, b in zip(domains, basis):
+                results.append(f"*{domain}*{b}*")
                     
 
             result_text = "\n".join(
