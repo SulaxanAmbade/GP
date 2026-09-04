@@ -2911,6 +2911,10 @@ def global_pattern_dashboard_page():
     # SEARCH
     # =========================================================
 
+        # =========================================================
+    # SEARCH
+    # =========================================================
+
     st.write("---")
 
     st.subheader(
@@ -2918,21 +2922,426 @@ def global_pattern_dashboard_page():
     )
 
     st.write(
-        "Search one or multiple terms using spaces or commas. "
-        "Each term can match either the URL pattern or the "
-        "URL pattern ID. URL pattern searches are "
-        "separator-independent."
+        "Search one or multiple URL patterns or URL pattern IDs. "
+        "Choose Exact Match for complete-value matching, "
+        "or Normalized Search for flexible separator-independent matching."
     )
+
+    # =========================================================
+    # SEARCH MODE
+    # =========================================================
+
+    search_mode = st.radio(
+        "Search Mode",
+        [
+            "Exact Match",
+            "Normalized Search"
+        ],
+        horizontal=True,
+        key="database_search_mode",
+        help=(
+            "Exact Match requires the complete URL pattern or URL pattern ID. "
+            "Normalized Search ignores separators such as *, -, _, and /."
+        )
+    )
+
+    # =========================================================
+    # SEARCH INPUT
+    # =========================================================
 
     search_string = st.text_area(
         "Search",
         placeholder=(
-            "Example: 1341291255 1341291256 1341270974"
+            "Examples:\n"
+            "*example.com*bug*bite*\n"
+            "1341291255\n"
+            "bug bite"
         ),
         key="main_search"
     )
 
+    # =========================================================
+    # PROCESS SEARCH
+    # =========================================================
+
     if search_string.strip():
+
+        if final_df.empty:
+
+            st.warning(
+                "⚠️ There is currently no shared dataset."
+            )
+
+        else:
+
+            # =================================================
+            # SPLIT MULTIPLE SEARCH TERMS
+            # =================================================
+
+            search_terms = [
+                term.strip()
+                for term in re.split(
+                    r"[,\n]+",
+                    search_string
+                )
+                if term.strip()
+            ]
+
+            # Remove duplicate searches while preserving order
+            search_terms = list(
+                dict.fromkeys(
+                    search_terms
+                )
+            )
+
+            # =================================================
+            # PREPARE DATABASE VALUES
+            # =================================================
+
+            raw_patterns = (
+                final_df[
+                    "url_pattern"
+                ]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .str.lower()
+            )
+
+            raw_ids = (
+                final_df[
+                    "url_pattern_id"
+                ]
+                .fillna("")
+                .astype(str)
+                .str.strip()
+                .str.lower()
+            )
+
+            normalized_patterns = (
+                final_df[
+                    "url_pattern"
+                ]
+                .fillna("")
+                .astype(str)
+                .apply(
+                    normalize_search_text
+                )
+            )
+
+            # =================================================
+            # INITIAL SEARCH MASK
+            # =================================================
+
+            combined_search_mask = pd.Series(
+                False,
+                index=final_df.index
+            )
+
+            matched_terms = {
+                index: []
+                for index in final_df.index
+            }
+
+            # =================================================
+            # SEARCH EACH TERM
+            # =================================================
+
+            for search_term in search_terms:
+
+                raw_search = (
+                    str(search_term)
+                    .strip()
+                    .lower()
+                )
+
+                # =============================================
+                # EXACT MATCH
+                # =============================================
+
+                if search_mode == "Exact Match":
+
+                    pattern_mask = (
+                        raw_patterns
+                        == raw_search
+                    )
+
+                    id_mask = (
+                        raw_ids
+                        == raw_search
+                    )
+
+                # =============================================
+                # NORMALIZED SEARCH
+                # =============================================
+
+                else:
+
+                    normalized_search = (
+                        normalize_search_text(
+                            search_term
+                        )
+                    )
+
+                    if normalized_search:
+
+                        pattern_mask = (
+                            normalized_patterns
+                            .str.contains(
+                                normalized_search,
+                                case=False,
+                                na=False,
+                                regex=False
+                            )
+                        )
+
+                    else:
+
+                        pattern_mask = pd.Series(
+                            False,
+                            index=final_df.index
+                        )
+
+                    # ID search stays partial in normalized mode
+                    id_mask = (
+                        raw_ids
+                        .str.contains(
+                            raw_search,
+                            case=False,
+                            na=False,
+                            regex=False
+                        )
+                    )
+
+                # =============================================
+                # COMBINE PATTERN + ID MATCH
+                # =============================================
+
+                term_mask = (
+                    pattern_mask
+                    | id_mask
+                )
+
+                combined_search_mask = (
+                    combined_search_mask
+                    | term_mask
+                )
+
+                # Track which search term matched each row
+                for index in final_df.index[
+                    term_mask
+                ]:
+
+                    matched_terms[
+                        index
+                    ].append(
+                        search_term
+                    )
+
+            # =================================================
+            # BUILD RESULTS
+            # =================================================
+
+            search_results = (
+                final_df[
+                    combined_search_mask
+                ]
+                .copy()
+            )
+
+            # =================================================
+            # RESULTS FOUND
+            # =================================================
+
+            if not search_results.empty:
+
+                st.success(
+                    f"🔍 Found "
+                    f"{len(search_results):,} "
+                    f"matching result(s) for "
+                    f"{len(search_terms)} search term(s) "
+                    f"using {search_mode}."
+                )
+
+                # =============================================
+                # RESULT VIEW
+                # =============================================
+
+                result_type = st.radio(
+                    "Search Result View",
+                    [
+                        "Original",
+                        "Domain - Basis Split"
+                    ],
+                    horizontal=True,
+                    key="result_view"
+                )
+
+                # =============================================
+                # ORIGINAL VIEW
+                # =============================================
+
+                if result_type == "Original":
+
+                    st.dataframe(
+                        search_results.fillna(""),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                    search_csv = (
+                        search_results
+                        .to_csv(
+                            index=False,
+                            encoding="utf-8"
+                        )
+                    )
+
+                    filename_search = re.sub(
+                        r"[^a-zA-Z0-9]+",
+                        "_",
+                        search_string
+                    ).strip("_")
+
+                    if not filename_search:
+
+                        filename_search = (
+                            "search_results"
+                        )
+
+                    # Keep filename manageable
+                    filename_search = (
+                        filename_search[:50]
+                    )
+
+                    st.download_button(
+                        label=(
+                            "📥 Download "
+                            "Original Results"
+                        ),
+                        data=search_csv,
+                        file_name=(
+                            f"{filename_search}"
+                            "_original.csv"
+                        ),
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+
+                # =============================================
+                # DOMAIN - BASIS SPLIT VIEW
+                # =============================================
+
+                else:
+
+                    split_results = []
+
+                    for _, row in (
+                        search_results
+                        .iterrows()
+                    ):
+
+                        domain, basis = (
+                            split_domain_basis(
+                                row[
+                                    "url_pattern"
+                                ]
+                            )
+                        )
+
+                        split_results.append(
+                            {
+                                "domain":
+                                    domain,
+
+                                "basis":
+                                    basis,
+
+                                "url_pattern_id":
+                                    row[
+                                        "url_pattern_id"
+                                    ],
+
+                                "priority":
+                                    row[
+                                        "priority"
+                                    ],
+
+                                "language_code":
+                                    row[
+                                        "language_code"
+                                    ]
+                            }
+                        )
+
+                    split_df = pd.DataFrame(
+                        split_results
+                    )
+
+                    st.dataframe(
+                        split_df.fillna(""),
+                        use_container_width=True,
+                        hide_index=True
+                    )
+
+                    split_csv = (
+                        split_df
+                        .to_csv(
+                            index=False,
+                            encoding="utf-8"
+                        )
+                    )
+
+                    filename_search = re.sub(
+                        r"[^a-zA-Z0-9]+",
+                        "_",
+                        search_string
+                    ).strip("_")
+
+                    if not filename_search:
+
+                        filename_search = (
+                            "search_results"
+                        )
+
+                    filename_search = (
+                        filename_search[:50]
+                    )
+
+                    st.download_button(
+                        label=(
+                            "📥 Download "
+                            "Domain - Basis Results"
+                        ),
+                        data=split_csv,
+                        file_name=(
+                            f"{filename_search}"
+                            "_domain_basis.csv"
+                        ),
+                        mime="text/csv",
+                        use_container_width=True
+                    )
+
+            # =================================================
+            # NO RESULTS
+            # =================================================
+
+            else:
+
+                if search_mode == "Exact Match":
+
+                    st.warning(
+                        "❌ No exact URL pattern or URL pattern ID "
+                        "was found for the entered search term(s). "
+                        "Try Normalized Search for broader matching."
+                    )
+
+                else:
+
+                    st.warning(
+                        "❌ No URL patterns or URL pattern IDs "
+                        "were found for the entered search term(s)."
+                    )
 
         if final_df.empty:
 
