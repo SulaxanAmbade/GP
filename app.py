@@ -16,11 +16,266 @@ from urllib.parse import unquote, urlsplit
 
 st.set_page_config(
     page_title="Global Patterns",
-    page_icon="📊",
-    layout="wide"
+    page_icon="🔴",
+    layout="centered",
+    initial_sidebar_state="collapsed"
 )
 
-st.title("📊 Global Pattern Database")
+# Keep Streamlit's app menu minimal so users cannot switch themes.
+st.set_option("client.toolbarMode", "minimal")
+
+
+def apply_red_theme():
+    st.markdown(
+        r"""
+        <style>
+        :root {
+            color-scheme: light !important;
+            --gp-red: #b7202e;
+            --gp-red-dark: #991b1b;
+            --gp-red-soft: #fff1f2;
+            --gp-red-border: #fecdd3;
+            --gp-bg: #fafafa;
+            --gp-surface: #ffffff;
+            --gp-text: #991b1b;
+            --gp-muted: #71717a;
+            --gp-border: #e4e4e7;
+            --gp-shadow: 0 8px 24px rgba(24, 24, 27, 0.06);
+        }
+
+        .stApp {
+            background:
+                radial-gradient(circle at top right, rgba(200,30,30,0.06), transparent 28rem),
+                var(--gp-bg);
+            color: var(--gp-text);
+        }
+
+        .block-container {
+            max-width: 1450px;
+            padding-top: 1.4rem;
+            padding-bottom: 3rem;
+        }
+
+        h1, h2, h3 {
+            color: var(--gp-text);
+            letter-spacing: -0.02em;
+        }
+
+        h1 { font-weight: 760; }
+        h2, h3 { font-weight: 700; }
+
+        label, .stCaption {
+            color: var(--gp-muted);
+        }
+
+        [data-testid="stHeader"] {
+            background: rgba(250,250,250,0.86);
+            backdrop-filter: blur(10px);
+        }
+
+        [data-testid="stToolbar"] {
+            right: 1rem;
+        }
+
+        div[data-testid="stMetric"] {
+            background: var(--gp-surface);
+            border: 1px solid var(--gp-border);
+            border-radius: 14px;
+            padding: 1rem 1.1rem;
+            box-shadow: var(--gp-shadow);
+        }
+
+        div[data-testid="stMetric"] label {
+            color: var(--gp-muted) !important;
+            font-weight: 600;
+        }
+
+        div[data-testid="stMetricValue"] {
+            color: var(--gp-muted);
+            font-weight: 750;
+        }
+
+        .stButton > button,
+        .stDownloadButton > button,
+        [data-testid="stFormSubmitButton"] > button {
+            min-height: 2.65rem;
+            border-radius: 10px;
+            transition: all 0.16s ease;
+            box-shadow: none;
+        }
+
+        .stButton > button[kind="primary"],
+        [data-testid="stFormSubmitButton"] > button {
+            background: var(--gp-red);
+            border-color: var(--gp-red);
+            color: #fff;
+        }
+
+        .stButton > button[kind="primary"]:hover,
+        [data-testid="stFormSubmitButton"] > button:hover {
+            background: var(--gp-red-dark);
+            border-color: var(--gp-red-dark);
+        }
+
+        .stButton > button:not([kind="primary"]),
+        .stDownloadButton > button {
+            background: var(--gp-surface);
+            border: 1px solid var(--gp-border);
+            color: var(--gp-text);
+        }
+
+        .stButton > button:not([kind="primary"]):hover,
+        .stDownloadButton > button:hover {
+            border-color: var(--gp-red);
+            color: var(--gp-red-dark);
+            background: var(--gp-red-soft);
+        }
+
+        div[data-baseweb="input"] > div,
+        div[data-baseweb="textarea"] > div,
+        div[data-baseweb="select"] > div {
+            border-radius: 10px !important;
+            border-color: var(--gp-border) !important;
+            background: var(--gp-surface) !important;
+        }
+
+        div[data-baseweb="input"] > div:focus-within,
+        div[data-baseweb="textarea"] > div:focus-within,
+        div[data-baseweb="select"] > div:focus-within {
+            border-color: var(--gp-red) !important;
+            box-shadow: 0 0 0 1px var(--gp-red) !important;
+        }
+
+        [data-testid="stFileUploader"] {
+            background: var(--gp-surface);
+            border: 1px dashed #d4d4d8;
+            border-radius: 14px;
+            padding: 0.35rem 0.65rem;
+        }
+
+        [data-testid="stExpander"] {
+            background: var(--gp-surface);
+            border: 1px solid var(--gp-border);
+            border-radius: 14px;
+            box-shadow: var(--gp-shadow);
+            overflow: hidden;
+        }
+
+        [data-baseweb="tab-list"] {
+            gap: 0.35rem;
+            border-bottom: 1px solid var(--gp-border);
+        }
+
+        button[data-baseweb="tab"] {
+            border-radius: 9px 9px 0 0;
+            padding-left: 1rem;
+            padding-right: 1rem;
+        }
+
+        button[data-baseweb="tab"][aria-selected="true"] {
+            color: var(--gp-red-dark);
+            font-weight: 700;
+        }
+
+        [data-testid="stDataFrame"] {
+            border: 1px solid var(--gp-border);
+            border-radius: 12px;
+            overflow: hidden;
+            background: var(--gp-surface);
+        }
+
+        [data-testid="stAlert"] {
+            border-radius: 12px;
+            border-width: 1px;
+        }
+
+        hr {
+            border: 0;
+            border-top: 1px solid var(--gp-border);
+            margin: 1.6rem 0;
+        }
+
+        .gp-hero {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 1rem;
+            padding: 1.1rem 1.25rem;
+            margin-bottom: 1.2rem;
+            background: linear-gradient(135deg, #ffffff 0%, #fff7f7 100%);
+            border: 1px solid var(--gp-red-border);
+            border-left: 5px solid var(--gp-red);
+            border-radius: 16px;
+            box-shadow: var(--gp-shadow);
+        }
+
+        .gp-title {
+            margin: 0;
+            color: var(--gp-text);
+            font-size: clamp(1.55rem, 2vw, 2.15rem);
+            font-weight: 780;
+            line-height: 1.15;
+        }
+
+        .gp-subtitle {
+            margin: 0.35rem 0 0;
+            color: var(--gp-muted);
+            font-size: 0.96rem;
+        }
+
+        .gp-user-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.45rem;
+            padding: 0.4rem 0.7rem;
+            border-radius: 999px;
+            background: var(--gp-red-soft);
+            color: var(--gp-red-dark);
+            border: 1px solid var(--gp-red-border);
+            font-weight: 650;
+            font-size: 0.86rem;
+        }
+
+        .gp-dot {
+            width: 0.48rem;
+            height: 0.48rem;
+            border-radius: 999px;
+            background: var(--gp-red);
+            display: inline-block;
+        }
+
+        [data-testid="stSidebar"] {
+            border-right: 1px solid var(--gp-border);
+        }
+
+        /* Make top navigation feel like a compact app bar */
+        [data-testid="stNavigation"] {
+            background: var(--gp-surface);
+            border: 1px solid var(--gp-border);
+            border-radius: 12px;
+            padding: 0.25rem;
+            box-shadow: var(--gp-shadow);
+            margin-bottom: 1rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+apply_red_theme()
+
+st.markdown(
+    """
+    <div class="gp-hero">
+        <div>
+            <div class="gp-title">Global Pattern Database</div>
+            <div class="gp-subtitle">Search, validate, generate, and review shared URL patterns from one workspace.</div>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True
+)
 
 
 # =============================================================
@@ -404,7 +659,7 @@ def admin_login():
     ):
         return True
 
-    st.subheader("🔐 User Login")
+    st.subheader("User Login")
 
     configured_users = get_app_users()
 
@@ -434,8 +689,10 @@ def admin_login():
         )
 
         login_submitted = st.form_submit_button(
-            "Login",
-            use_container_width=True
+            "Sign In",
+            width="content",
+            type="primary",
+
         )
 
     if login_submitted:
@@ -465,7 +722,7 @@ def admin_login():
             ] = normalized_username
 
             st.success(
-                "✅ Login successful."
+                "Login successful."
             )
 
             st.rerun()
@@ -473,7 +730,7 @@ def admin_login():
         else:
 
             st.error(
-                "❌ Incorrect username or password."
+                "Incorrect username or password."
             )
 
     return False
@@ -497,16 +754,21 @@ def render_user_header():
 
     with user_col:
 
-        st.caption(
-            "🟢 Signed in as "
-            f"{st.session_state.get('authenticated_username', 'admin').title()}"
+        username = st.session_state.get(
+            "authenticated_username",
+            "admin"
+        ).title()
+
+        st.markdown(
+            f'<span class="gp-user-pill"><span class="gp-dot"></span>Signed in as {username}</span>',
+            unsafe_allow_html=True
         )
 
     with logout_col:
 
         if st.button(
             "Logout",
-            use_container_width=True
+            width='content'
         ):
 
             st.session_state[
@@ -1681,7 +1943,7 @@ def render_coverage_report(
 ):
 
     st.subheader(
-        "🧭 URL Coverage Report"
+        "URL Coverage Report"
     )
 
     st.write(
@@ -1694,7 +1956,7 @@ def render_coverage_report(
     if final_df.empty:
 
         st.warning(
-            "⚠️ Upload a shared global pattern dataset before "
+            "Upload a shared global pattern dataset before "
             "creating a coverage report."
         )
 
@@ -1707,7 +1969,7 @@ def render_coverage_report(
     if complete_basis_catalog.empty:
 
         st.warning(
-            "⚠️ The active dataset has no usable language-basis rows."
+            "The active dataset has no usable language-basis rows."
         )
 
         return
@@ -1730,7 +1992,7 @@ def render_coverage_report(
     if not available_languages:
 
         st.warning(
-            "⚠️ No language codes are available "
+            "No language codes are available "
             "in the active dataset."
         )
 
@@ -1966,7 +2228,7 @@ def render_coverage_report(
             except Exception as err:
 
                 st.error(
-                    f"❌ Could not read the CSV: {err}"
+                    f"Could not read the CSV: {err}"
                 )
 
     removed_total_rows = 0
@@ -2172,7 +2434,7 @@ def render_coverage_report(
 def concatenate_sheet_page():
 
     st.header(
-        "🔗 Pattern Generator"
+        "Pattern Generator"
     )
 
     st.write(
@@ -2265,7 +2527,7 @@ def concatenate_sheet_page():
             )
 
             st.download_button(
-                "📥 Download Generated Patterns",
+                "Download Generated Patterns",
                 data=result_text,
                 file_name="generated_patterns.txt",
                 mime="text/plain",
@@ -2280,7 +2542,7 @@ def concatenate_sheet_page():
 def coverage_report_page():
 
     st.header(
-        "🧭 Coverage Report"
+        "Coverage Report"
     )
 
     final_df = load_shared_dataset()
@@ -2292,7 +2554,7 @@ def coverage_report_page():
     st.write("---")
 
     st.caption(
-        "📊 Shared URL Pattern Database • "
+        "Shared URL Pattern Database • "
         "Coverage uses the current active dataset."
     )
 
@@ -2312,13 +2574,13 @@ def global_pattern_dashboard_page():
     final_df = load_shared_dataset()
 
     st.subheader(
-        "📌 Current Shared Dataset"
+        "Current Shared Dataset"
     )
 
     if metadata is None:
 
         st.warning(
-            "⚠️ No dataset has been uploaded yet."
+            "No dataset has been uploaded yet."
         )
 
     else:
@@ -2376,7 +2638,7 @@ def global_pattern_dashboard_page():
     ):
 
         with st.expander(
-            "⚙️ Update Shared Dataset",
+            "Update Shared Dataset",
             expanded=False
         ):
 
@@ -2409,7 +2671,7 @@ def global_pattern_dashboard_page():
                 ]:
 
                     st.error(
-                        "🚨 No valid date was found "
+                        "No valid date was found "
                         "in the filename."
                     )
 
@@ -2442,7 +2704,7 @@ def global_pattern_dashboard_page():
                     )
 
                     st.success(
-                        "✅ File date matches today's date."
+                        "File date matches today's date."
                     )
 
                     date_col1, date_col2 = (
@@ -2496,7 +2758,7 @@ def global_pattern_dashboard_page():
                     )
 
                     st.error(
-                        "🚨 DATE MISMATCH DETECTED!"
+                        "Date mismatch detected"
                     )
 
                     date_col1, date_col2, date_col3 = (
@@ -2540,7 +2802,7 @@ def global_pattern_dashboard_page():
                     if difference_days > 0:
 
                         st.warning(
-                            f"⚠️ The uploaded dataset is "
+                            f"The uploaded dataset is "
                             f"{difference_days} day(s) older "
                             f"than today's date."
                         )
@@ -2548,7 +2810,7 @@ def global_pattern_dashboard_page():
                     elif difference_days < 0:
 
                         st.warning(
-                            f"⚠️ The uploaded dataset is "
+                            f"The uploaded dataset is "
                             f"{abs(difference_days)} day(s) "
                             f"in the future."
                         )
@@ -2571,14 +2833,15 @@ def global_pattern_dashboard_page():
                 if date_confirmed:
 
                     if st.button(
-                        "🔍 Process & Preview New Dataset",
+                        "Process & Preview Dataset",
+                        type="primary",
                         use_container_width=True
                     ):
 
                         try:
 
                             with st.spinner(
-                                "⏳ Processing new dataset..."
+                                "Processing new dataset..."
                             ):
 
                                 (
@@ -2610,13 +2873,13 @@ def global_pattern_dashboard_page():
                             ] = date_validation
 
                             st.success(
-                                "✅ New dataset processed successfully."
+                                "New dataset processed successfully."
                             )
 
                         except Exception as err:
 
                             st.error(
-                                "❌ Failed to process file."
+                                "Failed to process file."
                             )
 
                             st.info(
@@ -2626,7 +2889,7 @@ def global_pattern_dashboard_page():
                 else:
 
                     st.info(
-                        "🔒 Date verification is required "
+                        "Date verification is required "
                         "before the file can be processed."
                     )
 
@@ -2639,7 +2902,7 @@ def global_pattern_dashboard_page():
         st.write("---")
 
         st.subheader(
-            "👀 New Dataset Preview"
+            "New Dataset Preview"
         )
 
         pending_df = st.session_state[
@@ -2728,7 +2991,7 @@ def global_pattern_dashboard_page():
             ]:
 
                 st.error(
-                    "🚨 No valid date was detected "
+                    "No valid date was detected "
                     "in the filename. "
                     "The date was manually verified."
                 )
@@ -2738,7 +3001,7 @@ def global_pattern_dashboard_page():
             ]:
 
                 st.success(
-                    "✅ Dataset date verified — "
+                    "Dataset date verified — "
                     "matches today's date."
                 )
 
@@ -2763,7 +3026,7 @@ def global_pattern_dashboard_page():
                 )
 
                 st.warning(
-                    f"⚠️ Date mismatch acknowledged. "
+                    f"Date mismatch acknowledged. "
                     f"File date: "
                     f"{file_date.strftime('%d-%m-%Y')} | "
                     f"Current date: "
@@ -2789,7 +3052,7 @@ def global_pattern_dashboard_page():
         )
 
         st.warning(
-            "⚠️ Confirming below will replace the "
+            "Confirming below will replace the "
             "current dataset for ALL users."
         )
 
@@ -2809,7 +3072,8 @@ def global_pattern_dashboard_page():
         with confirm_col1:
 
             if st.button(
-                "🚨 Replace Shared Dataset",
+                "Replace Shared Dataset",
+                type="primary",
                 disabled=not confirm,
                 use_container_width=True
             ):
@@ -2827,7 +3091,7 @@ def global_pattern_dashboard_page():
                         )
 
                     with st.spinner(
-                        "⏳ Replacing shared dataset..."
+                        "Replacing shared dataset..."
                     ):
 
                         replace_shared_dataset(
@@ -2860,7 +3124,7 @@ def global_pattern_dashboard_page():
                         )
 
                     st.success(
-                        "🎉 Shared dataset replaced successfully!"
+                        "Shared dataset replaced successfully."
                     )
 
                     st.rerun()
@@ -2868,7 +3132,7 @@ def global_pattern_dashboard_page():
                 except Exception as err:
 
                     st.error(
-                        "❌ Failed to replace shared dataset."
+                        "Failed to replace shared dataset."
                     )
 
                     st.info(
@@ -2882,7 +3146,7 @@ def global_pattern_dashboard_page():
         with confirm_col2:
 
             if st.button(
-                "❌ Cancel Update",
+                "Cancel Update",
                 use_container_width=True
             ):
 
@@ -2918,7 +3182,7 @@ def global_pattern_dashboard_page():
     st.write("---")
 
     st.subheader(
-        "🔎 Search URL Patterns / IDs"
+        "Search URL Patterns / IDs"
     )
 
     st.write(
@@ -2969,7 +3233,7 @@ def global_pattern_dashboard_page():
         if final_df.empty:
 
             st.warning(
-                "⚠️ There is currently no shared dataset."
+                "There is currently no shared dataset."
             )
 
         else:
@@ -3156,7 +3420,7 @@ def global_pattern_dashboard_page():
             if not search_results.empty:
 
                 st.success(
-                    f"🔍 Found "
+                    f"Found "
                     f"{len(search_results):,} "
                     f"matching result(s) for "
                     f"{len(search_terms)} search term(s) "
@@ -3216,7 +3480,7 @@ def global_pattern_dashboard_page():
 
                     st.download_button(
                         label=(
-                            "📥 Download "
+                            "Download "
                             "Original Results"
                         ),
                         data=search_csv,
@@ -3310,7 +3574,7 @@ def global_pattern_dashboard_page():
 
                     st.download_button(
                         label=(
-                            "📥 Download "
+                            "Download "
                             "Domain - Basis Results"
                         ),
                         data=split_csv,
@@ -3331,7 +3595,7 @@ def global_pattern_dashboard_page():
                 if search_mode == "Exact Match":
 
                     st.warning(
-                        "❌ No exact URL pattern or URL pattern ID "
+                        "No exact URL pattern or URL pattern ID "
                         "was found for the entered search term(s). "
                         "Try Normalized Search for broader matching."
                     )
@@ -3339,14 +3603,14 @@ def global_pattern_dashboard_page():
                 else:
 
                     st.warning(
-                        "❌ No URL patterns or URL pattern IDs "
+                        "No URL patterns or URL pattern IDs "
                         "were found for the entered search term(s)."
                     )
 
         if final_df.empty:
 
             st.warning(
-                "⚠️ There is currently no shared dataset."
+                "There is currently no shared dataset."
             )
 
         else:
@@ -3461,7 +3725,7 @@ def global_pattern_dashboard_page():
             if not search_results.empty:
 
                 st.success(
-                    f"🔍 Found "
+                    f"Found "
                     f"{len(search_results):,} "
                     f"matching result(s) for "
                     f"{len(search_terms)} search term(s)."
@@ -3504,7 +3768,7 @@ def global_pattern_dashboard_page():
 
                     st.download_button(
                         label=(
-                            "📥 Download "
+                            "Download "
                             "Original Results"
                         ),
                         data=search_csv,
@@ -3575,7 +3839,7 @@ def global_pattern_dashboard_page():
 
                     st.download_button(
                         label=(
-                            "📥 Download "
+                            "Download "
                             "Domain - Basis Results"
                         ),
                         data=split_csv,
@@ -3590,7 +3854,7 @@ def global_pattern_dashboard_page():
             else:
 
                 st.warning(
-                    "❌ No URL patterns or URL pattern IDs "
+                    "No URL patterns or URL pattern IDs "
                     "found for the entered search terms."
                 )
 
@@ -3601,7 +3865,7 @@ def global_pattern_dashboard_page():
     st.write("---")
 
     st.subheader(
-        "📋 Complete Shared Dataset"
+        "Complete Shared Dataset"
     )
 
     if final_df.empty:
@@ -3682,7 +3946,7 @@ def global_pattern_dashboard_page():
         )
 
         st.download_button(
-            label="📥 Download Complete Shared Dataset",
+            label="Download Complete Shared Dataset",
             data=csv_data,
             file_name=(
                 f"{filename_base}_cleaned.csv"
@@ -3704,7 +3968,7 @@ def global_pattern_dashboard_page():
     st.write("---")
 
     st.caption(
-        "📊 Shared URL Pattern Database • "
+        "Shared URL Pattern Database • "
         "All users access the same active dataset."
     )
 
@@ -3745,17 +4009,17 @@ navigation = st.navigation(
         st.Page(
             global_pattern_dashboard_page,
             title="Global Pattern Dashboard",
-            icon="📊"
+            icon=":material/dashboard:"
         ),
         st.Page(
             coverage_report_page,
             title="Coverage Report",
-            icon="🧭"
+            icon=":material/analytics:"
         ),
         st.Page(
             concatenate_sheet_page,
-            title="Concatenate Sheet",
-            icon="🔗"
+            title="Pattern Generator",
+            icon=":material/link:"
         )
     ],
     position="top"

@@ -1,0 +1,30 @@
+[client]
+toolbarMode = "minimal"
+
+[theme]
+base = "light"
+primaryColor = "#b7202e"
+backgroundColor = "#fafafa"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#b7202e"
+borderColor = "#e4e4e7"
+dataframeBorderColor = "#e4e4e7"
+dataframeHeaderBackgroundColor = "#f4f4f5"
+showWidgetBorder = true
+baseRadius = "medium"
+buttonRadius = "medium"
+showSidebarBorder = true
+
+# If a Streamlit build exposes a dark-theme choice externally,
+# keep its visible palette identical to the light theme.
+[theme.dark]
+primaryColor = "#b7202e"
+backgroundColor = "#fafafa"
+secondaryBackgroundColor = "#ffffff"
+textColor = "#b7202e"
+borderColor = "#e4e4e7"
+dataframeBorderColor = "#e4e4e7"
+dataframeHeaderBackgroundColor = "#f4f4f5"
+showWidgetBorder = true
+baseRadius = "medium"
+buttonRadius = "medium"
