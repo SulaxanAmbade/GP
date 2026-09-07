@@ -1229,6 +1229,75 @@ def normalize_search_text(text):
     return text.strip().lower()
 
 
+def normalized_word_match(search_word, pattern_word):
+
+    search_word = str(search_word).strip().lower()
+    pattern_word = str(pattern_word).strip().lower()
+
+    if not search_word or not pattern_word:
+        return False
+
+    # Exact word match.
+    if search_word == pattern_word:
+        return True
+
+    # Common singular/plural forms.
+    if word_forms_match(search_word, pattern_word):
+        return True
+
+    # Controlled adjective/noun variation used by normalized search.
+    # Example: health <-> healthy. The length guard avoids broad
+    # matches such as hair <-> hairy.
+    if min(len(search_word), len(pattern_word)) >= 5:
+        if search_word + "y" == pattern_word:
+            return True
+
+        if pattern_word + "y" == search_word:
+            return True
+
+    return False
+
+
+def normalized_pattern_match(normalized_search, normalized_pattern):
+
+    search_words = str(normalized_search).split()
+    pattern_words = str(normalized_pattern).split()
+
+    if (
+        not search_words
+        or not pattern_words
+        or len(search_words) > len(pattern_words)
+    ):
+        return False
+
+    window_size = len(search_words)
+
+    # Search words must appear together and in the same order.
+    # Individual words may use controlled word-form variations.
+    for start in range(
+        len(pattern_words) - window_size + 1
+    ):
+
+        pattern_window = pattern_words[
+            start:start + window_size
+        ]
+
+        if all(
+            normalized_word_match(
+                search_word,
+                pattern_word
+            )
+            for search_word, pattern_word
+            in zip(
+                search_words,
+                pattern_window
+            )
+        ):
+            return True
+
+    return False
+
+
 # =============================================================
 # DOMAIN - BASIS SPLIT
 # =============================================================
@@ -1477,6 +1546,11 @@ def word_forms_match(
             forms.add(
                 f"{word[:-3]}y"
             )
+
+        if len(word) > 3 and word.endswith("s"):
+                    forms.add(
+                        f"{word[:-1]}"
+                    )
 
         if len(word) > 3 and word.endswith("es"):
 
@@ -2318,6 +2392,8 @@ def render_coverage_report(
         if total_urls
         else 0
     )
+
+    # ImpressionsCoverage = ()
 
     metric1, metric2, metric3, metric4 = (
         st.columns(4)
@@ -3349,14 +3425,12 @@ def global_pattern_dashboard_page():
 
                     if normalized_search:
 
-                        pattern_mask = (
-                            normalized_patterns
-                            .str.contains(
-                                normalized_search,
-                                case=False,
-                                na=False,
-                                regex=False
-                            )
+                        pattern_mask = normalized_patterns.apply(
+                            lambda pattern:
+                                normalized_pattern_match(
+                                    normalized_search,
+                                    pattern
+                                )
                         )
 
                     else:

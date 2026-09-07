@@ -1368,6 +1368,8 @@ def word_forms_match(first_word, second_word):
 
         if len(word) > 3 and word.endswith("ies"):
             forms.add(f"{word[:-3]}y")
+        if len(word) > 3 and word.endswith("s"):
+            forms.add(f"{word[:-1]}")
 
         if len(word) > 3 and word.endswith("es"):
             forms.add(word[:-2])
