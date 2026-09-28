@@ -3286,9 +3286,6 @@ def global_pattern_dashboard_page():
     # SEARCH
     # =========================================================
 
-        # =========================================================
-    # SEARCH
-    # =========================================================
 
     st.write("---")
 
@@ -3716,123 +3713,7 @@ def global_pattern_dashboard_page():
                         "were found for the entered search term(s)."
                     )
 
-        # if final_df.empty:
-
-        #     st.warning(
-        #         "There is currently no shared dataset."
-        #     )
-
-        # else:
-
-        #     search_terms = [
-        #         term.strip()
-        #         for term in re.split(
-        #             r"[,\n]+",
-        #             search_string
-        #         )
-        #         if term.strip()
-        #     ]
-
-        #     search_terms = list(
-        #         dict.fromkeys(
-        #             search_terms
-        #         )
-        #     )
-
-        #     combined_search_mask = pd.Series(
-        #         False,
-        #         index=final_df.index
-        #     )
-
-        #     matched_terms = {
-        #         index: []
-        #         for index in final_df.index
-        #     }
-
-        #     normalized_patterns = (
-        #         final_df[
-        #             "url_pattern"
-        #         ]
-        #         .fillna("")
-        #         .astype(str)
-        #         .apply(
-        #             normalize_search_text
-        #         )
-        #     )
-
-        #     normalized_ids = (
-        #         final_df[
-        #             "url_pattern_id"
-        #         ]
-        #         .fillna("")
-        #         .astype(str)
-        #         .str.strip()
-        #         .str.lower()
-        #     )
-
-        #     for search_term in search_terms:
-
-        #         normalized_search = (
-        #             normalize_search_text(
-        #                 search_term
-        #             )
-        #         )
-
-        #         pattern_mask = (
-        #             normalized_patterns
-        #             .str.contains(
-        #                 normalized_search,
-        #                 case=False,
-        #                 na=False,
-        #                 regex=False
-        #             )
-        #         )
-
-        #         normalized_id_search = (
-        #             str(search_term)
-        #             .strip()
-        #             .lower()
-        #         )
-
-        #         id_mask = (
-        #             normalized_ids
-        #             .str.contains(
-        #                 normalized_id_search,
-        #                 case=False,
-        #                 na=False,
-        #                 regex=False
-        #             )
-        #         )
-
-        #         term_mask = (
-        #             pattern_mask
-        #             | id_mask
-        #         )
-
-        #         combined_search_mask = (
-        #             combined_search_mask
-        #             | term_mask
-        #         )
-
-        #         for index in final_df.index[
-        #             term_mask
-        #         ]:
-
-        #             matched_terms[
-        #                 index
-        #             ].append(
-        #                 search_term
-        #             )
-
-        #     search_results = (
-        #         final_df[
-        #             combined_search_mask
-        #         ]
-        #         .copy()
-        #     )
-
-            # if not search_results.empty:
-
+        
                 st.success(
                     f"Found "
                     f"{len(search_results):,} "
@@ -3960,12 +3841,6 @@ def global_pattern_dashboard_page():
                         use_container_width=True
                     )
 
-            # else:
-
-            #     st.warning(
-            #         "No URL patterns or URL pattern IDs "
-            #         "found for the entered search terms."
-            #     )
 
     # =========================================================
     # FULL DATASET
