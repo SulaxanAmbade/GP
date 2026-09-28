@@ -2507,44 +2507,49 @@ def render_coverage_report(
 # CONCATENATE / PATTERN GENERATOR PAGE
 # =============================================================
 
+
 def concatenate_sheet_page():
 
-    st.header(
-        "Pattern Generator"
-    )
+    st.header("Concatenate Sheet")
 
     st.write(
-        "Enter multiple domains and multiple bases. "
-        "Every domain will be combined with every basis."
+        "Enter Domain and Basis values in the table below. "
+        "Each row will generate one pattern."
     )
 
-    col1, col2 = st.columns(2)
+    # =====================================================
+    # INPUT DATAFRAME
+    # =====================================================
 
-    with col1:
+    default_df = pd.DataFrame(
+        {
+            "Domain": [""],
+            "Basis": [""]
+        }
+    )
 
-        domains_input = st.text_area(
-            "Domains",
-            placeholder=(
-                "domain1.com\n"
-                "domain2.com\n"
-                "domain3.com"
+    input_df = st.data_editor(
+        default_df,
+        num_rows="dynamic",
+        use_container_width=True,
+        key="pattern_generator_table",
+        column_config={
+            "Domain": st.column_config.TextColumn(
+                "Domain",
+                help="Example: example.com",
+                width="large"
             ),
-            height=200,
-            key="generator_domains"
-        )
+            "Basis": st.column_config.TextColumn(
+                "Basis",
+                help="Example: labor day",
+                width="large"
+            )
+        }
+    )
 
-    with col2:
-
-        basis_input = st.text_area(
-            "Basis",
-            placeholder=(
-                "labor day\n"
-                "hair shampoo\n"
-                "italian restaurants"
-            ),
-            height=200,
-            key="generator_basis"
-        )
+    # =====================================================
+    # GENERATE
+    # =====================================================
 
     if st.button(
         "Generate Patterns",
@@ -2552,64 +2557,94 @@ def concatenate_sheet_page():
         use_container_width=True
     ):
 
-        domains = [
-            x.strip()
-            for x in domains_input.splitlines()
-            if x.strip()
-        ]
+        # Clean values
+        df = input_df.copy()
 
-        basis = [
-            x.strip()
-            for x in basis_input.splitlines()
-            if x.strip()
-        ]
+        df["Domain"] = (
+            df["Domain"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
 
-        if not domains:
+        df["Basis"] = (
+            df["Basis"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+        )
+
+        # Remove empty rows
+        df = df[
+            (df["Domain"] != "") &
+            (df["Basis"] != "")
+        ].copy()
+
+        if df.empty:
 
             st.warning(
-                "Please enter at least one domain."
-            )
-
-        elif not basis:
-
-            st.warning(
-                "Please enter at least one basis."
+                "Please enter at least one Domain and Basis."
             )
 
         else:
 
-            results = []
-
             # =================================================
-            # EVERY DOMAIN × EVERY BASIS
+            # GENERATE PATTERN FOR EACH ROW
             # =================================================
-            for domain, b in zip(domains, basis):
-                results.append(f"*{domain}*{b}*")
-                    
 
-            result_text = "\n".join(
-                results
+            df["Pattern"] = (
+                "*" +
+                df["Domain"] +
+                "*" +
+                df["Basis"] +
+                "*"
             )
 
             st.success(
-                f"Generated {len(results):,} pattern(s)."
+                f"Generated {len(df):,} pattern(s)."
             )
 
-            st.text_area(
-                "Generated Patterns",
-                value=result_text,
-                height=300,
-                key="generated_patterns"
+            # =================================================
+            # DISPLAY RESULT AS DATAFRAME
+            # =================================================
+
+            st.dataframe(
+                df,
+                use_container_width=True,
+                hide_index=True
+            )
+
+            # =================================================
+            # TXT DOWNLOAD
+            # =================================================
+
+            result_text = "\n".join(
+                df["Pattern"].tolist()
             )
 
             st.download_button(
-                "Download Generated Patterns",
+                "Download Patterns As TXT",
                 data=result_text,
                 file_name="generated_patterns.txt",
                 mime="text/plain",
                 use_container_width=True
             )
 
+            # =================================================
+            # CSV DOWNLOAD
+            # =================================================
+
+            csv_data = df.to_csv(
+                index=False
+            ).encode("utf-8")
+
+            st.download_button(
+                "Download As CSV",
+                data=csv_data,
+                file_name="generated_patterns.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
 
 # =============================================================
 # COVERAGE REPORT PAGE
@@ -4092,7 +4127,7 @@ navigation = st.navigation(
         ),
         st.Page(
             concatenate_sheet_page,
-            title="Pattern Generator",
+            title="Concatenate Sheet",
             icon=":material/link:"
         )
     ],
