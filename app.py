@@ -2592,14 +2592,28 @@ def concatenate_sheet_page():
             # GENERATE PATTERN FOR EACH ROW
             # =================================================
 
-            df["Pattern"] = (
-                "*" +
-                df["Domain"] +
-                "*" +
-                df["Basis"] +
-                "*"
-            )
+            def generate_pattern(row):
 
+                domain = row["Domain"]
+                basis = row["Basis"]
+
+                # Special promote condition
+                if domain.startswith(
+                    "patternkeywords.global.promote"
+                ):
+                    return (
+                        f"*patternkeywords.global.promote*"
+                        f"{basis}*"
+                    )
+
+                # Normal domain
+                return f"*{domain}*{basis}*"
+
+
+            df["Pattern"] = df.apply(
+                generate_pattern,
+                axis=1
+            )
             st.success(
                 f"Generated {len(df):,} pattern(s)."
             )
