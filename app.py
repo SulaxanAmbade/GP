@@ -3,7 +3,9 @@ import re
 import sqlite3
 import hmac
 import json
+from html import escape
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from functools import lru_cache
 from urllib.parse import unquote, urlsplit
 
@@ -142,6 +144,11 @@ st.markdown(
 # DATABASE
 # =============================================================
 DB_FILE = "url_patterns.db"
+ADMIN_LOOKUP_FLAG = "(Lookup)"
+PATTERN_COLUMNS = [
+    "url_pattern", "url_pattern_id", "priority", "language_code",
+    "admin_name", "updated_admin_id",
+]
 
 
 def get_connection():
@@ -161,7 +168,8 @@ def initialize_database():
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS url_patterns (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, url_pattern TEXT,
-                url_pattern_id TEXT, priority TEXT, language_code TEXT
+                url_pattern_id TEXT, priority TEXT, language_code TEXT,
+                admin_name TEXT, updated_admin_id TEXT
             )
         """)
         cursor.execute("PRAGMA table_info(dataset_metadata)")
@@ -170,8 +178,10 @@ def initialize_database():
             if column not in existing_columns:
                 cursor.execute(f"ALTER TABLE dataset_metadata ADD COLUMN {column} TEXT")
         cursor.execute("PRAGMA table_info(url_patterns)")
-        if "language_code" not in {row[1] for row in cursor.fetchall()}:
-            cursor.execute("ALTER TABLE url_patterns ADD COLUMN language_code TEXT")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        for column in ("language_code", "admin_name", "updated_admin_id"):
+            if column not in existing_columns:
+                cursor.execute(f"ALTER TABLE url_patterns ADD COLUMN {column} TEXT")
         conn.commit()
     finally:
         conn.close()
@@ -193,7 +203,9 @@ def load_shared_dataset():
     conn = get_connection()
     try:
         df = pd.read_sql_query("""
-            SELECT url_pattern, url_pattern_id, priority, language_code FROM url_patterns
+            SELECT url_pattern, url_pattern_id, priority, language_code,
+                   admin_name, updated_admin_id
+            FROM url_patterns
         """, conn)
         if not df.empty:
             df["_url_pattern_length"] = df["url_pattern"].fillna("").astype(str).str.len()
@@ -206,18 +218,27 @@ def load_shared_dataset():
 
 
 def replace_shared_dataset(new_df, filename, file_date, updated_by):
+    # Allow older DataFrames to be stored with a blank admin_name.
+    prepared = new_df.copy()
+    for column in ("admin_name", "updated_admin_id"):
+        if column not in prepared.columns:
+            prepared[column] = None
+    prepared["updated_admin_id"] = prepared["updated_admin_id"].map(normalize_admin_id)
+    prepared["admin_name"] = prepared["admin_name"].map(
+        lambda value: None if pd.isna(value) or not str(value).strip() else str(value).strip()
+    )
+    records = [
+        tuple(None if pd.isna(value) else str(value) for value in row)
+        for row in prepared[PATTERN_COLUMNS].itertuples(index=False, name=None)
+    ]
     conn = get_connection()
     try:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM url_patterns")
-        records = [
-            tuple(None if pd.isna(value) else str(value) for value in row)
-            for row in new_df[["url_pattern", "url_pattern_id", "priority", "language_code"]]
-            .itertuples(index=False, name=None)
-        ]
         cursor.executemany("""
-            INSERT INTO url_patterns (url_pattern, url_pattern_id, priority, language_code)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO url_patterns
+                (url_pattern, url_pattern_id, priority, language_code, admin_name, updated_admin_id)
+            VALUES (?, ?, ?, ?, ?, ?)
         """, records)
         cursor.execute("""
             INSERT INTO dataset_metadata
@@ -229,7 +250,7 @@ def replace_shared_dataset(new_df, filename, file_date, updated_by):
                 updated_by = excluded.updated_by
         """, (
             filename, file_date.strftime("%d-%m-%Y") if file_date is not None else "",
-            datetime.now().strftime("%d-%m-%Y %I:%M:%S %p"), len(new_df),
+            datetime.now().strftime("%d-%m-%Y %I:%M:%S %p"), len(prepared),
             str(updated_by).strip() if updated_by else "Unknown",
         ))
         conn.commit()
@@ -308,16 +329,14 @@ def render_user_header():
         return
     user_col, logout_col = st.columns([8, 1])
     with user_col:
-        username = st.session_state.get("authenticated_username", "admin").title()
+        username = escape(st.session_state.get("authenticated_username", "admin").title())
         st.markdown(
             f'<span class="gp-user-pill"><span class="gp-dot"></span>Signed in as {username}</span>',
             unsafe_allow_html=True,
         )
     with logout_col:
         if st.button("Logout", width="content"):
-            st.session_state["admin_authenticated"] = False
-            for key in ("authenticated_username", "login_username", "login_password"):
-                st.session_state.pop(key, None)
+            st.session_state.clear()
             st.rerun()
 
 
@@ -350,12 +369,145 @@ def validate_file_date(filename):
     }
 
 
+def clean_admin_value(value):
+    if pd.isna(value):
+        return None
+    value = re.sub(r"[\u200b-\u200d\ufeff]", "", str(value))
+    value = " ".join(value.split())
+    return None if value.casefold() in {"", "none", "nan", "null", "<na>", "n/a", "-"} else value
+
+
+def normalize_admin_id(value):
+    """Normalize integer IDs read by Excel as floats, without float rounding."""
+    value = clean_admin_value(value)
+    if value is not None:
+        numeric_value = value
+        if re.fullmatch(r"\d{1,3}(?:,\d{3})+(?:\.0+)?", value):
+            numeric_value = value.replace(",", "")
+        try:
+            number = Decimal(numeric_value)
+            if number.is_finite() and number >= 0 and number == number.to_integral_value():
+                return str(int(number))
+        except InvalidOperation:
+            pass
+    return value
+
+
+def admin_lookup_base_name(value):
+    """Ignore trailing set-ID labels and repair flags only for lookup matching."""
+    name = clean_admin_value(value)
+    if not name:
+        return None
+    # Already repaired names may return as reference rows on the next upload.
+    name = re.sub(
+        rf"(?:\s*{re.escape(ADMIN_LOOKUP_FLAG)})+\s*$", "", name,
+        flags=re.IGNORECASE,
+    ).strip()
+    name = re.sub(
+        r"\s+(?:[\[(]\s*)?set[\s_-]*id\s*(?:=|:)\s*[\w.-]+(?:\s*[\])])?\s*$",
+        "", name, flags=re.IGNORECASE,
+    ).strip()
+    return name or None
+
+
+def get_database_admin_reference():
+    """Read saved ID/name pairs before the uploaded dataset replaces them."""
+    conn = get_connection()
+    try:
+        return pd.read_sql_query("""
+            SELECT DISTINCT updated_admin_id, admin_name
+            FROM url_patterns
+            WHERE updated_admin_id IS NOT NULL AND admin_name IS NOT NULL
+        """, conn)
+    finally:
+        conn.close()
+
+
+def repair_admin_alignment(df, database_reference=None):
+    """Move misplaced IDs on the same row, then fill names from the database.
+
+    Use valid workbook pairs only when the database has no pair for that ID.
+    Set-ID variants share a base name; filled names receive a lookup flag.
+    Different base names for one ID remain unresolved.
+    """
+    repaired = df.copy()
+    for column in ("admin_name", "updated_admin_id"):
+        if column not in repaired.columns:
+            repaired[column] = None
+    # Pandas can convert returned None values back into float NaN. Keep the
+    # working columns as strings with an empty-string missing-value sentinel.
+    ids = repaired["updated_admin_id"].map(normalize_admin_id).fillna("").astype(str)
+    names = repaired["admin_name"].map(clean_admin_value).fillna("").astype(str)
+    if database_reference is None:
+        database_reference = pd.DataFrame(columns=["updated_admin_id", "admin_name"])
+    database_ids = database_reference["updated_admin_id"].map(normalize_admin_id).fillna("").astype(str)
+    database_names = database_reference["admin_name"].map(clean_admin_value).fillna("").astype(str)
+    known_ids = set(ids.loc[ids.ne("")]) | set(database_ids.loc[database_ids.ne("")])
+    # Numeric values in admin_name are treated as misplaced administrator IDs.
+    def is_misplaced_id(value):
+        value = clean_admin_value(value)
+        return bool(value) and (
+            re.fullmatch(r"\d+", normalize_admin_id(value) or "") is not None
+            or normalize_admin_id(value) in known_ids
+        )
+    misplaced = names.map(is_misplaced_id).astype(bool)
+    candidate_ids = names.map(normalize_admin_id).fillna("").astype(str)
+    recovered = misplaced & ids.eq("")
+    overwritten = misplaced & ids.ne("") & candidate_ids.ne(ids)
+    # The user-specified repair moves the ID even when the destination contains
+    # a different value; admin_name is cleared on that same row.
+    ids.loc[misplaced] = candidate_ids.loc[misplaced]
+    names.loc[misplaced] = ""
+
+    def make_lookup(pair_ids, pair_names):
+        candidates = {}
+        for admin_id, name in zip(pair_ids, pair_names):
+            base_name = admin_lookup_base_name(name)
+            if admin_id and base_name and not is_misplaced_id(base_name):
+                key = base_name.casefold()
+                candidates.setdefault(admin_id, {}).setdefault(key, base_name)
+        lookup = {
+            admin_id: next(iter(values.values()))
+            for admin_id, values in candidates.items() if len(values) == 1
+        }
+        conflicts = {admin_id for admin_id, values in candidates.items() if len(values) > 1}
+        return lookup, conflicts
+
+    database_lookup, database_conflicts = make_lookup(database_ids, database_names)
+    workbook_lookup, workbook_conflicts = make_lookup(ids, names)
+    # Prefer database names for blanks. Never overwrite an existing valid name.
+    database_matches = ids.map(database_lookup).fillna("").astype(str)
+    database_filled = names.eq("") & database_matches.ne("")
+    names.loc[database_filled] = database_matches.loc[database_filled] + " " + ADMIN_LOOKUP_FLAG
+    workbook_matches = ids.map(workbook_lookup).fillna("").astype(str)
+    # A conflicting historical DB pair must not block a unique valid pair in
+    # the current workbook (for example, missing names for admin ID 19153).
+    workbook_filled = names.eq("") & workbook_matches.ne("")
+    names.loc[workbook_filled] = workbook_matches.loc[workbook_filled] + " " + ADMIN_LOOKUP_FLAG
+    filled = database_filled | workbook_filled
+    repaired["updated_admin_id"] = ids.astype(object).where(ids.ne(""), None)
+    repaired["admin_name"] = names.astype(object).where(names.ne(""), None)
+    stats = {
+        "repaired_rows": int((misplaced | filled).sum()),
+        "misplaced_ids": int(misplaced.sum()),
+        "recovered_ids": int(recovered.sum()),
+        "filled_names": int(filled.sum()),
+        "overwritten_ids": int(overwritten.sum()),
+        "database_names_filled": int(database_filled.sum()),
+        "workbook_names_filled": int(workbook_filled.sum()),
+        "unresolved_rows": int(names.eq("").sum()),
+        "conflicting_ids": sorted(database_conflicts | workbook_conflicts),
+    }
+    return repaired, stats
+
+
 def parse_uploaded_file(uploaded_file):
     df = None
     last_error_msg = ""
     try:
         uploaded_file.seek(0)
-        df = pd.read_excel(uploaded_file, engine="xlrd", header=None)
+        engine = "openpyxl" if str(getattr(uploaded_file, "name", "")).lower().endswith(".xlsx") else "xlrd"
+        df = pd.read_excel(uploaded_file, engine=engine, header=None)
     except Exception as excel_err:
         last_error_msg = str(excel_err)
         if (
@@ -368,7 +520,14 @@ def parse_uploaded_file(uploaded_file):
                 raw_content = uploaded_file.read().decode("utf-16")
                 raw_rows = [line.split("\t") for line in raw_content.splitlines() if line.strip()]
                 row_lengths = [len(row) for row in raw_rows]
-                standard_cols = max(set(row_lengths), key=row_lengths.count) if row_lengths else 0
+                # The header width takes precedence so admin_name is not truncated.
+                header = next((
+                    row for row in raw_rows
+                    if "url_pattern" in [str(value).strip().lower() for value in row]
+                ), None)
+                standard_cols = len(header) if header is not None else (
+                    max(set(row_lengths), key=row_lengths.count) if row_lengths else 0
+                )
                 aligned_rows = []
                 for row_list in raw_rows:
                     while row_list and row_list[-1] == "":
@@ -398,11 +557,11 @@ def parse_uploaded_file(uploaded_file):
             header_row_idx = idx
             break
     header_row_idx = 0 if header_row_idx is None else header_row_idx
-    df.columns = [str(col).strip() for col in df.iloc[header_row_idx]]
+    df.columns = [str(col).strip().lower() for col in df.iloc[header_row_idx]]
     df = df.iloc[header_row_idx + 1:].reset_index(drop=True)
     for col in (
         "url_pattern", "url_pattern_id", "priority", "total_count",
-        "language_code", "url_pattern_order",
+        "language_code", "url_pattern_order", "admin_name", "updated_admin_id",
     ):
         if col not in df.columns:
             df[col] = None
@@ -418,7 +577,13 @@ def parse_uploaded_file(uploaded_file):
     if shifted_language_mask.any():
         df.loc[shifted_language_mask, "language_code"] = df.loc[shifted_language_mask, "url_pattern_order"]
     fixed_count += int(shifted_language_mask.sum())
-    final_df = df[["url_pattern", "url_pattern_id", "priority", "language_code"]].copy()
+    database_reference = get_database_admin_reference()
+    df, admin_repairs = repair_admin_alignment(df, database_reference)
+    fixed_count += admin_repairs["repaired_rows"]
+    final_df = df[PATTERN_COLUMNS].copy()
+    final_df["admin_name"] = final_df["admin_name"].map(
+        lambda value: None if pd.isna(value) or not str(value).strip() else str(value).strip()
+    )
     initial_len = len(final_df)
     final_df.drop_duplicates(inplace=True)
     duplicates_removed = initial_len - len(final_df)
@@ -426,6 +591,7 @@ def parse_uploaded_file(uploaded_file):
     final_df.sort_values("_url_pattern_length", ascending=False, inplace=True)
     final_df.drop(columns=["_url_pattern_length"], inplace=True)
     final_df.reset_index(drop=True, inplace=True)
+    final_df.attrs["admin_repairs"] = admin_repairs
     return final_df, fixed_count, duplicates_removed
 
 
@@ -523,7 +689,6 @@ def basis_matches_url(normalized_basis, searchable_url):
 # =============================================================
 @st.cache_data(show_spinner=False, max_entries=4)
 def make_basis_catalog(pattern_df):
-    # Cache catalog construction across reruns; dataset contents are part of the key.
     columns = [
         "domain", "normalized_domain", "basis", "normalized_basis",
         "language_code", "url_pattern_id", "priority",
@@ -621,7 +786,6 @@ def remove_report_total_rows(input_df):
 # =============================================================
 @lru_cache(maxsize=50000)
 def _coverage_word_forms(word):
-    # Preserve the current word_forms_match rules exactly.
     forms = {word}
     if len(word) > 3:
         if word.endswith("ies"):
@@ -635,12 +799,7 @@ def _coverage_word_forms(word):
 
 @lru_cache(maxsize=4)
 def _coverage_basis_index(bases):
-    """Build a shared-prefix index; cache keys include the actual basis values.
-
-    Each edge is indexed under all forms of its original word. Matching an
-    edge requires intersecting word forms, just like word_forms_match.
-    Cached dictionaries are only read after construction.
-    """
+    """Build a shared-prefix index; cache keys include actual basis values."""
     children = [{}]
     form_edges = [{}]
     terminals = [[]]
@@ -671,7 +830,6 @@ def _coverage_match_ids(searchable_url, index):
     for word in searchable_url.split():
         forms = _coverage_word_forms(word)
         next_active = set()
-        # Start a new match at this word as well as extending existing ones.
         for node in active | {0}:
             edges = form_edges[node]
             for form in forms:
@@ -679,16 +837,11 @@ def _coverage_match_ids(searchable_url, index):
         for node in next_active:
             matches.update(terminals[node])
         active = next_active
-    # Preserve the catalog order used by the original report.
     return tuple(sorted(matches))
 
 
 def create_coverage_report(input_df, basis_catalog):
-    """Return URL summary, match details, coverage pivot, and basis pivot.
-
-    Matches remain global, contiguous, ordered, and singular/plural aware.
-    Select a single language before calling, as render_coverage_report does.
-    """
+    """Return URL summary, match details, coverage pivot, and basis pivot."""
     summary_columns = [
         "URL", "URL Domain", "Language Code", "Coverage Status",
         "Matched Basis Count", "Matching Bases", "Keyword Impressions", "Revenue",
@@ -710,7 +863,6 @@ def create_coverage_report(input_df, basis_catalog):
     if basis_catalog["language_code"].nunique(dropna=False) != 1:
         raise ValueError("Filter the basis catalog to one language first.")
     selected_language = str(basis_catalog["language_code"].iloc[0])
-
     prepared, _ = remove_report_total_rows(input_df)
     prepared = prepared.copy()
     prepared["URL"] = prepared["URL"].astype(str).str.strip()
@@ -724,14 +876,11 @@ def create_coverage_report(input_df, basis_catalog):
             pd.DataFrame(columns=coverage_columns),
             pd.DataFrame(columns=basis_columns),
         )
-
-    # Convert the catalog once instead of filtering a DataFrame for every URL.
     records = list(basis_catalog[[
         "normalized_basis", "basis", "language_code", "domain",
         "url_pattern_id", "priority",
     ]].itertuples(index=False, name=None))
     index = _coverage_basis_index(tuple(str(row[0]) for row in records))
-    # URLs with the same normalized path/query/fragment share their match work.
     path_matches = {}
     summary_rows = []
     detail_rows = []
@@ -765,7 +914,6 @@ def create_coverage_report(input_df, basis_catalog):
             url, domain, selected_language, "Covered", len(ids),
             " | ".join(matched_bases), impressions, revenue,
         ))
-
     url_summary_df = pd.DataFrame(summary_rows, columns=summary_columns)
     detail_df = pd.DataFrame(detail_rows, columns=detail_columns)
     coverage_pivot = url_summary_df.groupby(
@@ -1005,7 +1153,7 @@ def coverage_report_page():
 def render_dataset_update():
     with st.expander("Update Shared Dataset", expanded=False):
         new_file = st.file_uploader(
-            "Upload new .xls file", type=["xls"], accept_multiple_files=False,
+            "Upload new workbook (.xls or .xlsx)", type=["xls", "xlsx"], accept_multiple_files=False,
             key="admin_file_uploader",
         )
         if new_file is None:
@@ -1056,8 +1204,11 @@ def render_dataset_update():
                         "pending_dataset": preview_df, "pending_filename": new_file.name,
                         "pending_fixed_count": fixed_count, "pending_duplicates": duplicates_removed,
                         "pending_date_validation": date_validation,
+                        "pending_admin_repairs": preview_df.attrs.get("admin_repairs", {}),
                     })
                     st.success("New dataset processed successfully.")
+                    if preview_df["admin_name"].fillna("").astype(str).str.strip().eq("").all():
+                        st.warning("No admin_name values were found. Include an admin_name column in the workbook to populate the search dropdown.")
                 except Exception as err:
                     st.error("Failed to process file.")
                     st.info(f"Details: {err}")
@@ -1070,6 +1221,7 @@ def clear_pending_dataset():
         "pending_dataset", "pending_filename", "pending_fixed_count", "pending_duplicates",
         "pending_date_validation", "confirm_dataset_replacement", "admin_file_uploader",
         "manual_date_confirmation", "date_mismatch_confirmation",
+        "pending_admin_repairs",
     ):
         st.session_state.pop(key, None)
 
@@ -1105,6 +1257,38 @@ def render_pending_dataset():
             )
     st.write("**First 100 rows:**")
     st.dataframe(pending_df.head(100).fillna(""), use_container_width=True, hide_index=True)
+    admin_repairs = st.session_state.get("pending_admin_repairs", {})
+    if admin_repairs:
+        st.info(
+            f"Admin repairs: {admin_repairs['misplaced_ids']:,} ID value(s) removed from admin_name; "
+            f"{admin_repairs['recovered_ids']:,} missing ID(s) recovered; "
+            f"{admin_repairs['database_names_filled']:,} name(s) filled from the database; "
+            f"{admin_repairs['workbook_names_filled']:,} name(s) filled from workbook pairs. "
+            f"Filled names are marked {ADMIN_LOOKUP_FLAG}."
+        )
+        if admin_repairs["conflicting_ids"]:
+            st.warning(
+                "These admin IDs have conflicting names in a lookup source. "
+                "Ambiguous pairs were not used from that source: " + ", ".join(admin_repairs["conflicting_ids"])
+            )
+        if admin_repairs["overwritten_ids"]:
+            st.info(
+                f"{admin_repairs['overwritten_ids']:,} existing updated_admin_id value(s) "
+                "were replaced with the ID found in admin_name on the same row."
+            )
+        if admin_repairs["unresolved_rows"]:
+            st.warning(
+                f"{admin_repairs['unresolved_rows']:,} input row(s) still have no resolved admin name. "
+                "Names cannot be inferred without a unique valid ID/name pair."
+            )
+            unresolved = pending_df.loc[pending_df["admin_name"].isna()]
+            with st.expander("Review Rows With Unresolved Admin Names", expanded=False):
+                st.dataframe(unresolved.fillna(""), use_container_width=True, hide_index=True)
+                st.download_button(
+                    "Download Unresolved Admin Rows", data=unresolved.to_csv(index=False),
+                    file_name="unresolved_admin_rows.csv", mime="text/csv",
+                    use_container_width=True,
+                )
     st.warning("Confirming below will replace the current dataset for ALL users.")
     confirm = st.checkbox(
         "I understand that this will replace the current shared dataset.",
@@ -1121,9 +1305,10 @@ def render_pending_dataset():
                         st.session_state.get("authenticated_username", "Unknown"),
                     )
                 clear_pending_dataset()
-                # Clear this session's old report after the active dataset changes.
                 st.session_state.pop("coverage_report", None)
                 st.session_state.pop("coverage_report_language", None)
+                # The replacement workbook may have a different set of admins.
+                st.session_state.pop("database_admin_name", None)
                 make_basis_catalog.clear()
                 _coverage_basis_index.cache_clear()
                 st.success("Shared dataset replaced successfully.")
@@ -1138,69 +1323,103 @@ def render_pending_dataset():
 
 
 # =============================================================
-# DATASET SEARCH UI
+# ADMIN FILTER AND DATASET SEARCH
 # =============================================================
-def render_dataset_search(final_df):
-    st.write("---")
-    st.subheader("Search URL Patterns / IDs")
-    st.write(
-        "Search one or multiple URL patterns or URL pattern IDs. Choose Exact Match "
-        "for complete-value matching, or Normalized Search for flexible "
-        "separator-independent matching."
-    )
-    search_mode = st.radio(
-        "Search Mode", ["Exact Match", "Normalized Search"], horizontal=True,
-        key="database_search_mode",
-        help=("Exact Match requires the complete URL pattern or URL pattern ID. "
-              "Normalized Search ignores separators such as *, -, _, and /."),
-    )
-    search_string = st.text_area(
-        "Search", placeholder="Examples:\n*example.com*bug*bite*\n1341291255\nbug bite",
-        key="main_search",
-    )
-    if not search_string.strip():
-        return
-    if final_df.empty:
-        st.warning("There is currently no shared dataset.")
-        return
+def get_admin_options(final_df):
+    """None = all admins; empty string = rows without an admin_name."""
+    names = final_df["admin_name"].fillna("").astype(str).str.strip()
+    available = sorted(names.loc[names.ne("")].unique().tolist(), key=lambda value: (value.casefold(), value))
+    return [None] + ([""] if names.eq("").any() else []) + available
+
+
+def search_dataset(final_df, search_string, search_mode, selected_admin=None):
+    """Apply the admin filter AND the selected search; multiple terms use OR."""
+    filtered_df = final_df.copy()
+    if selected_admin is not None:
+        admin_values = filtered_df["admin_name"].fillna("").astype(str).str.strip()
+        filtered_df = filtered_df.loc[admin_values.eq(selected_admin)].copy()
     search_terms = list(dict.fromkeys(
         term.strip() for term in re.split(r"[,\n]+", search_string) if term.strip()
     ))
-    raw_patterns = final_df["url_pattern"].fillna("").astype(str).str.strip().str.lower()
-    raw_ids = final_df["url_pattern_id"].fillna("").astype(str).str.strip().str.lower()
-    normalized_patterns = final_df["url_pattern"].fillna("").astype(str).apply(normalize_search_text)
-    combined_search_mask = pd.Series(False, index=final_df.index)
+    if filtered_df.empty or not search_terms:
+        return filtered_df, search_terms
+    raw_patterns = filtered_df["url_pattern"].fillna("").astype(str).str.strip().str.lower()
+    raw_ids = filtered_df["url_pattern_id"].fillna("").astype(str).str.strip().str.lower()
+    basis_values = filtered_df["url_pattern"].fillna("").astype(str).map(
+        lambda value: split_domain_basis(value)[1]
+    ).str.strip().str.lower()
+    search_values = raw_patterns
+    normalized_values = search_values.apply(normalize_search_text) if search_mode == "Normalized Search" else None
+    combined_search_mask = pd.Series(False, index=filtered_df.index)
     for search_term in search_terms:
-        raw_search = str(search_term).strip().lower()
+        raw_search = search_term.strip().lower()
         if search_mode == "Exact Match":
-            pattern_mask = raw_patterns.eq(raw_search)
+            pattern_mask = search_values.eq(raw_search) | basis_values.eq(raw_search)
             id_mask = raw_ids.eq(raw_search)
         else:
             normalized_search = normalize_search_text(search_term)
             pattern_mask = (
-                normalized_patterns.apply(lambda pattern: normalized_pattern_match(normalized_search, pattern))
-                if normalized_search else pd.Series(False, index=final_df.index)
+                normalized_values.apply(lambda value: normalized_pattern_match(normalized_search, value))
+                if normalized_search else pd.Series(False, index=filtered_df.index)
             )
             id_mask = raw_ids.str.contains(raw_search, case=False, na=False, regex=False)
         combined_search_mask |= pattern_mask | id_mask
-    search_results = final_df.loc[combined_search_mask].copy()
-    if search_results.empty:
-        if search_mode == "Exact Match":
-            st.warning(
-                "No exact URL pattern or URL pattern ID was found for the entered "
-                "search term(s). Try Normalized Search for broader matching."
-            )
-        else:
-            st.warning("No URL patterns or URL pattern IDs were found for the entered search term(s).")
+    return filtered_df.loc[combined_search_mask].copy(), search_terms
+
+
+def render_dataset_search(final_df):
+    st.write("---")
+    st.subheader("Search URL Patterns / IDs / Bases")
+    st.write(
+        "Select an admin to search their rows, or choose All Admins. "
+        "Search URL patterns, pattern IDs, or bases in the same search box. "
+        "Leave Search empty to list all rows for the selected admin."
+    )
+    if final_df.empty:
+        st.warning("There is currently no shared dataset.")
         return
+    options = get_admin_options(final_df)
+    # Also handle another user's dataset replacement during this session.
+    if st.session_state.get("database_admin_name") not in options:
+        st.session_state.pop("database_admin_name", None)
+    selected_admin = st.selectbox(
+        "Admin name", options=options,
+        format_func=lambda value: "All Admins" if value is None else ("No Admin Name" if value == "" else value),
+        key="database_admin_name",
+        help="Values come from the admin_name column in the active shared dataset.",
+    )
+    if not any(value not in (None, "") for value in options):
+        st.info("Upload a workbook containing admin_name values to populate this dropdown.")
+    search_mode = st.radio(
+        "Search Mode", ["Exact Match", "Normalized Search"], horizontal=True,
+        key="database_search_mode",
+        help=("Exact Match accepts a complete URL pattern, pattern ID, or basis. "
+              "Normalized Search ignores separators such as *, -, _, and /."),
+    )
+    search_string = st.text_area(
+        "Search",
+        placeholder="Examples:\n*example.com*bug*bite*\n1341291255\nbug*bite\nbug bite",
+        key="main_search",
+    )
+    if not search_string.strip() and selected_admin is None:
+        st.caption("Enter a search term or select an admin to view matching rows.")
+        return
+    search_results, search_terms = search_dataset(
+        final_df, search_string, search_mode, selected_admin,
+    )
+    if search_results.empty:
+        st.warning("No matching rows were found for the selected admin and search criteria.")
+        return
+    admin_label = "All Admins" if selected_admin is None else (selected_admin or "No Admin Name")
     st.success(
-        f"Found {len(search_results):,} matching result(s) for {len(search_terms)} "
-        f"search term(s) using {search_mode}."
+        f"Found {len(search_results):,} matching result(s) for {admin_label}."
+        + (f" Search: {len(search_terms)} term(s), {search_mode}." if search_terms else "")
     )
     result_type = st.radio(
         "Search Result View", ["Original", "Domain - Basis Split"], horizontal=True, key="result_view",
     )
-    filename_search = re.sub(r"[^a-zA-Z0-9]+", "_", search_string).strip("_") or "search_results"
+    filename_seed = f"{admin_label}_{search_string}" if selected_admin is not None else search_string
+    filename_search = re.sub(r"[^a-zA-Z0-9]+", "_", filename_seed).strip("_") or "search_results"
     filename_search = filename_search[:50]
     if result_type == "Original":
         st.dataframe(search_results.fillna(""), use_container_width=True, hide_index=True)
@@ -1215,6 +1434,8 @@ def render_dataset_search(final_df):
             split_results.append({
                 "domain": domain, "basis": basis, "url_pattern_id": row.url_pattern_id,
                 "priority": row.priority, "language_code": row.language_code,
+                "admin_name": row.admin_name,
+                "updated_admin_id": row.updated_admin_id,
             })
         split_df = pd.DataFrame(split_results)
         st.dataframe(split_df.fillna(""), use_container_width=True, hide_index=True)
