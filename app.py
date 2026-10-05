@@ -5,6 +5,7 @@ import hmac
 import json
 import hashlib
 from html import escape
+from collections import Counter
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from functools import lru_cache
@@ -816,60 +817,67 @@ def _coverage_word_forms(word):
 
 @lru_cache(maxsize=4)
 def _coverage_basis_index(bases):
-    """Build a shared-prefix index with optional word-gap wildcard states."""
+    """Index contiguous fragments; wildcard-separated fragments may reorder."""
     children = [{}]
     form_edges = [{}]
     exact_edges = [{}]
     terminals = [[]]
-    gap_edges = {}
-    gap_nodes = set()
+    fragment_ids = {}
+    watchers = []
+    condition_counts = []
     for basis_id, basis in enumerate(bases):
-        node = 0
-        words = basis.split()
-        if not words:
-            continue
-        for word in words:
-            child = children[node].get(word)
-            if child is None:
-                child = len(children)
-                children[node][word] = child
-                children.append({})
-                form_edges.append({})
-                exact_edges.append({})
-                terminals.append([])
-                if word == "*":
-                    gap_edges[node] = child
-                    gap_nodes.add(child)
-                elif word.startswith("~") and word.endswith("~"):
-                    exact_edges[node].setdefault(word[1:-1], set()).add(child)
-                else:
-                    # Basis words stay literal. Singular alternatives are
-                    # generated only from the URL, so word cannot match words.
-                    form_edges[node].setdefault(word, set()).add(child)
-            node = child
-        terminals[node].append(basis_id)
-    return form_edges, exact_edges, terminals, gap_edges, gap_nodes
+        fragments = [tuple(part.split()) for part in basis.split("*") if part.strip()]
+        required = Counter(fragments)
+        condition_counts.append(len(required))
+        for fragment, occurrences in required.items():
+            fragment_id = fragment_ids.get(fragment)
+            if fragment_id is None:
+                fragment_id = len(fragment_ids)
+                fragment_ids[fragment] = fragment_id
+                watchers.append({})
+                node = 0
+                for word in fragment:
+                    child = children[node].get(word)
+                    if child is None:
+                        child = len(children)
+                        children[node][word] = child
+                        children.append({})
+                        form_edges.append({})
+                        exact_edges.append({})
+                        terminals.append([])
+                        if word.startswith("~") and word.endswith("~"):
+                            exact_edges[node].setdefault(word[1:-1], set()).add(child)
+                        else:
+                            form_edges[node].setdefault(word, set()).add(child)
+                    node = child
+                terminals[node].append(fragment_id)
+            watchers[fragment_id].setdefault(occurrences, []).append(basis_id)
+    return form_edges, exact_edges, terminals, watchers, condition_counts
 
 
 def _coverage_match_ids(searchable_url, index):
-    form_edges, exact_edges, terminals, gap_edges, gap_nodes = index
+    form_edges, exact_edges, terminals, watchers, condition_counts = index
     active = set()
+    occurrences = Counter()
+    satisfied = Counter()
     matches = set()
     for word in searchable_url.split():
         forms = _coverage_word_forms(word)
-        starts = active | {0}
-        # Enter a gap without consuming a word. Gap states remain active while
-        # intervening URL words are skipped, and can match the next term now.
-        starts |= {gap_edges[node] for node in tuple(starts) if node in gap_edges}
-        next_active = starts & gap_nodes
-        for node in starts:
-            # Locked terms use the original URL token, never a singular form.
+        next_active = set()
+        for node in active | {0}:
+            # Tilde locks match the original token, not its singular forms.
             next_active.update(exact_edges[node].get(word, ()))
-            edges = form_edges[node]
             for form in forms:
-                next_active.update(edges.get(form, ()))
-        for node in next_active:
-            matches.update(terminals[node])
+                next_active.update(form_edges[node].get(form, ()))
+        found_fragments = {
+            fragment_id for node in next_active for fragment_id in terminals[node]
+        }
+        for fragment_id in found_fragments:
+            occurrences[fragment_id] += 1
+            for basis_id in watchers[fragment_id].get(occurrences[fragment_id], ()):
+                satisfied[basis_id] += 1
+                if satisfied[basis_id] == condition_counts[basis_id]:
+                    matches.add(basis_id)
         active = next_active
     return tuple(sorted(matches))
 
@@ -1078,10 +1086,11 @@ def render_coverage_report(final_df):
     st.write(
         "Check URLs against bases from the active global pattern dataset. "
         "Matching is global and does not compare domains. A basis matches when "
-        "its complete words appear in order in the URL path. Plural URL words "
+        "all its *-separated parts appear anywhere in the URL path, in any order. "
+        "Words within each part remain adjacent. Plural URL words "
         "can match singular bases, but singular URL words cannot match plural bases. "
-        "Use * to allow intervening words: "
-        "word1*word4 matches word1-word2-word3-word4. "
+        "Use * to separate required parts: "
+        "prime*day*dewalt matches dewalt-tool-deals-prime-day. "
         "Wrap a word in ~ to lock it: sharp*~eye~ matches sharp-eye, "
         "but not sharp-eyes. Backslashes in bases are ignored."
     )
