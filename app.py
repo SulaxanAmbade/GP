@@ -3,6 +3,7 @@ import re
 import sqlite3
 import hmac
 import json
+import hashlib
 from html import escape
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -672,16 +673,28 @@ def domains_match(url_domain, pattern_domain):
     )
 
 
+def normalize_coverage_basis(basis):
+    """Preserve wildcard gaps and exact ~word~ locks; ignore backslashes."""
+    raw_basis = unquote(str(basis)).replace("\\", "")
+    tokens = []
+    for part in re.split(r"(~[^~]*~|\*)", raw_basis):
+        if part == "*":
+            if tokens and tokens[-1] != "*":
+                tokens.append("*")
+        elif part.startswith("~") and part.endswith("~") and len(part) >= 2:
+            # Lock each word of a phrase; the phrase's words stay adjacent.
+            tokens.extend(f"~{word}~" for word in normalize_search_text(part[1:-1]).split())
+        else:
+            tokens.extend(normalize_search_text(part).split())
+    if tokens and tokens[-1] == "*":
+        tokens.pop()
+    return " ".join(tokens)
+
+
 def basis_matches_url(normalized_basis, searchable_url):
-    basis_words = normalized_basis.split()
-    url_words = searchable_url.split()
-    if not basis_words or len(basis_words) > len(url_words):
-        return False
-    size = len(basis_words)
-    return any(
-        all(word_forms_match(a, b) for a, b in zip(basis_words, url_words[start:start + size]))
-        for start in range(len(url_words) - size + 1)
-    )
+    return bool(_coverage_match_ids(
+        searchable_url, _coverage_basis_index((normalized_basis,)),
+    ))
 
 
 # =============================================================
@@ -699,7 +712,7 @@ def make_basis_catalog(pattern_df):
     ]].itertuples(index=False, name=None):
         domain, basis = split_domain_basis(pattern)
         normalized_domain = normalize_domain(domain)
-        normalized_basis = normalize_search_text(basis)
+        normalized_basis = normalize_coverage_basis(basis)
         language_code = str(language).strip().lower()
         if (
             not normalized_domain or not normalized_basis or not language_code
@@ -786,23 +799,30 @@ def remove_report_total_rows(input_df):
 # =============================================================
 @lru_cache(maxsize=50000)
 def _coverage_word_forms(word):
+    """URL-side forms only: exact token plus common singular spellings."""
     forms = {word}
     if len(word) > 3:
         if word.endswith("ies"):
             forms.add(word[:-3] + "y")
-        if word.endswith("s"):
             forms.add(word[:-1])
-        if word.endswith("es"):
-            forms.update((word[:-2], word[:-1]))
+        elif word.endswith(("sses", "shes", "ches", "xes", "zes")):
+            forms.add(word[:-2])
+        elif word in {"buses", "statuses"}:
+            forms.add(word[:-2])
+        elif word.endswith("s") and not word.endswith(("ss", "us", "is")):
+            forms.add(word[:-1])
     return frozenset(forms)
 
 
 @lru_cache(maxsize=4)
 def _coverage_basis_index(bases):
-    """Build a shared-prefix index; cache keys include actual basis values."""
+    """Build a shared-prefix index with optional word-gap wildcard states."""
     children = [{}]
     form_edges = [{}]
+    exact_edges = [{}]
     terminals = [[]]
+    gap_edges = {}
+    gap_nodes = set()
     for basis_id, basis in enumerate(bases):
         node = 0
         words = basis.split()
@@ -815,22 +835,36 @@ def _coverage_basis_index(bases):
                 children[node][word] = child
                 children.append({})
                 form_edges.append({})
+                exact_edges.append({})
                 terminals.append([])
-                for form in _coverage_word_forms(word):
-                    form_edges[node].setdefault(form, set()).add(child)
+                if word == "*":
+                    gap_edges[node] = child
+                    gap_nodes.add(child)
+                elif word.startswith("~") and word.endswith("~"):
+                    exact_edges[node].setdefault(word[1:-1], set()).add(child)
+                else:
+                    # Basis words stay literal. Singular alternatives are
+                    # generated only from the URL, so word cannot match words.
+                    form_edges[node].setdefault(word, set()).add(child)
             node = child
         terminals[node].append(basis_id)
-    return form_edges, terminals
+    return form_edges, exact_edges, terminals, gap_edges, gap_nodes
 
 
 def _coverage_match_ids(searchable_url, index):
-    form_edges, terminals = index
+    form_edges, exact_edges, terminals, gap_edges, gap_nodes = index
     active = set()
     matches = set()
     for word in searchable_url.split():
         forms = _coverage_word_forms(word)
-        next_active = set()
-        for node in active | {0}:
+        starts = active | {0}
+        # Enter a gap without consuming a word. Gap states remain active while
+        # intervening URL words are skipped, and can match the next term now.
+        starts |= {gap_edges[node] for node in tuple(starts) if node in gap_edges}
+        next_active = starts & gap_nodes
+        for node in starts:
+            # Locked terms use the original URL token, never a singular form.
+            next_active.update(exact_edges[node].get(word, ()))
             edges = form_edges[node]
             for form in forms:
                 next_active.update(edges.get(form, ()))
@@ -859,10 +893,9 @@ def create_coverage_report(input_df, basis_catalog):
         "Keyword Impressions", "Revenue",
     ]
     if basis_catalog.empty:
-        raise ValueError("Select a language with at least one usable basis.")
-    if basis_catalog["language_code"].nunique(dropna=False) != 1:
-        raise ValueError("Filter the basis catalog to one language first.")
-    selected_language = str(basis_catalog["language_code"].iloc[0])
+        raise ValueError("Select at least one language with usable bases.")
+    selected_languages = sorted(basis_catalog["language_code"].astype(str).unique())
+    language_label = ", ".join(selected_languages)
     prepared, _ = remove_report_total_rows(input_df)
     prepared = prepared.copy()
     prepared["URL"] = prepared["URL"].astype(str).str.strip()
@@ -894,11 +927,11 @@ def create_coverage_report(input_df, basis_catalog):
             path_matches[searchable_url] = ids
         if not ids:
             summary_rows.append((
-                url, domain, selected_language, "No Matching Basis", 0,
+                url, domain, language_label, "No Matching Basis", 0,
                 "No Matching Basis", impressions, revenue,
             ))
             detail_rows.append((
-                url, domain, selected_language, "No Matching Basis",
+                url, domain, language_label, "No Matching Basis",
                 "No Matching Basis", "", "", "", impressions, revenue,
             ))
             continue
@@ -910,8 +943,9 @@ def create_coverage_report(input_df, basis_catalog):
                 url, domain, language, "Covered", basis, source_domain,
                 pattern_id, priority, impressions, revenue,
             ))
+        matched_bases = list(dict.fromkeys(matched_bases))
         summary_rows.append((
-            url, domain, selected_language, "Covered", len(ids),
+            url, domain, language_label, "Covered", len(matched_bases),
             " | ".join(matched_bases), impressions, revenue,
         ))
     url_summary_df = pd.DataFrame(summary_rows, columns=summary_columns)
@@ -940,6 +974,102 @@ def create_coverage_report(input_df, basis_catalog):
     return url_summary_df, detail_df, coverage_pivot, basis_pivot
 
 
+def add_user_coverage_bases(basis_catalog, edited_rows, selected_languages):
+    """Combine existing bases with unique user additions for this report only."""
+    if isinstance(selected_languages, str):
+        selected_languages = [selected_languages]
+    selected_languages = sorted(set(selected_languages))
+    if (not selected_languages or basis_catalog.empty
+            or not basis_catalog["language_code"].isin(selected_languages).all()):
+        raise ValueError("Use the basis catalog for the report's selected languages.")
+    existing = set(zip(basis_catalog["language_code"], basis_catalog["normalized_basis"]))
+    added_rows = []
+    invalid = []
+    for value in edited_rows["New Basis"]:
+        if pd.isna(value):
+            continue
+        # Several bases can be entered in one cell, separated by semicolons.
+        for raw_basis in re.split(r"[;\n]+", str(value)):
+            basis = raw_basis.strip().strip("*").strip()
+            if not basis:
+                continue
+            normalized = normalize_coverage_basis(basis)
+            if not normalized:
+                invalid.append(raw_basis.strip())
+                continue
+            for language in selected_languages:
+                if (language, normalized) in existing:
+                    continue
+                existing.add((language, normalized))
+                added_rows.append({
+                    "domain": "User Added", "normalized_domain": "",
+                    "basis": basis, "normalized_basis": normalized,
+                    "language_code": language,
+                    "url_pattern_id": f"user-added-{len(added_rows) + 1}",
+                    "priority": "",
+                })
+    additions = pd.DataFrame(added_rows, columns=basis_catalog.columns)
+    combined = pd.concat([basis_catalog, additions], ignore_index=True)
+    combined = combined.sort_values(
+        "normalized_basis", key=lambda values: values.str.len(), ascending=False,
+        kind="stable",
+    ).reset_index(drop=True)
+    return combined, additions, invalid
+
+
+def render_coverage_results(report, title, key_prefix):
+    """Show url_summary_df directly, with optional aggregate and match details."""
+    url_summary_df, detail_df, coverage_pivot, basis_pivot = report
+    st.subheader(title)
+    total_urls = len(url_summary_df)
+    covered_urls = int(url_summary_df["Coverage Status"].eq("Covered").sum())
+    metric1, metric2, metric3, metric4 = st.columns(4)
+    metric1.metric("URLs Checked", f"{total_urls:,}")
+    metric2.metric("Covered URLs", f"{covered_urls:,}")
+    metric3.metric("No Matching Basis", f"{total_urls - covered_urls:,}")
+    metric4.metric("Coverage Rate", f"{covered_urls / total_urls * 100 if total_urls else 0:.1f}%")
+    st.dataframe(url_summary_df, use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download URL Summary", data=url_summary_df.to_csv(index=False),
+        file_name=f"{key_prefix}_url_summary.csv", mime="text/csv",
+        use_container_width=True, key=f"{key_prefix}_download_summary",
+    )
+    with st.expander("Coverage Summary, Basis Performance, and Match Details", expanded=False):
+        summary_tab, basis_tab, detail_tab = st.tabs([
+            "Coverage Summary", "Basis Performance", "Match Details",
+        ])
+        with summary_tab:
+            st.dataframe(coverage_pivot, use_container_width=True, hide_index=True)
+        with basis_tab:
+            st.dataframe(basis_pivot, use_container_width=True, hide_index=True)
+            st.caption(
+                "A URL's performance is attributed to each matching basis. "
+                "Use URL Summary for non-duplicated totals."
+            )
+        with detail_tab:
+            st.dataframe(detail_df, use_container_width=True, hide_index=True)
+        download1, download2 = st.columns(2)
+        download1.download_button(
+            "Download Basis Report", data=basis_pivot.to_csv(index=False),
+            file_name=f"{key_prefix}_basis_report.csv", mime="text/csv",
+            use_container_width=True, key=f"{key_prefix}_download_basis",
+        )
+        download2.download_button(
+            "Download Match Details", data=detail_df.to_csv(index=False),
+            file_name=f"{key_prefix}_match_details.csv", mime="text/csv",
+            use_container_width=True, key=f"{key_prefix}_download_details",
+        )
+
+
+def clear_coverage_reports():
+    for key in (
+        "coverage_report", "coverage_report_language", "coverage_report_languages", "coverage_report_input",
+        "coverage_report_catalog_signature", "coverage_recheck_report",
+        "coverage_recheck_signature",
+    ):
+        st.session_state.pop(key, None)
+
+
 # =============================================================
 # COVERAGE REPORT UI
 # =============================================================
@@ -948,8 +1078,12 @@ def render_coverage_report(final_df):
     st.write(
         "Check URLs against bases from the active global pattern dataset. "
         "Matching is global and does not compare domains. A basis matches when "
-        "its normalized words appear together in the URL path, including common "
-        "singular/plural variations."
+        "its complete words appear in order in the URL path. Plural URL words "
+        "can match singular bases, but singular URL words cannot match plural bases. "
+        "Use * to allow intervening words: "
+        "word1*word4 matches word1-word2-word3-word4. "
+        "Wrap a word in ~ to lock it: sharp*~eye~ matches sharp-eye, "
+        "but not sharp-eyes. Backslashes in bases are ignored."
     )
     if final_df.empty:
         st.warning("Upload a shared global pattern dataset before creating a coverage report.")
@@ -965,16 +1099,30 @@ def render_coverage_report(final_df):
     if not available_languages:
         st.warning("No language codes are available in the active dataset.")
         return
-    selected_language = st.selectbox(
-        "Language code", available_languages, format_func=lambda value: value.upper(),
-        key="coverage_language_code",
-        help="Only bases with this language code will be checked against the submitted URLs.",
+    language_key = "coverage_language_codes"
+    if language_key in st.session_state:
+        saved = st.session_state[language_key]
+        valid = [language for language in saved if language in available_languages]
+        if valid != saved:
+            st.session_state[language_key] = valid
+    selected_languages = st.multiselect(
+        "Language codes", available_languages,
+        default=(None if language_key in st.session_state else
+                 (["en"] if "en" in available_languages else available_languages[:1])),
+        format_func=lambda value: value.upper(), key=language_key,
+        help="Choose one or more languages. A URL is covered if any selected language's basis matches.",
     )
+    selected_languages = tuple(sorted(selected_languages))
+    if not selected_languages:
+        st.info("Select at least one language code before entering URLs.")
+        return
     basis_catalog = complete_basis_catalog.loc[
-        complete_basis_catalog["language_code"].eq(selected_language)
+        complete_basis_catalog["language_code"].isin(selected_languages)
     ].copy()
     st.caption(
-        f"{len(basis_catalog):,} unique bases are available for language {selected_language.upper()}."
+        f"{len(basis_catalog):,} language/basis pairs are available for "
+        f"{', '.join(language.upper() for language in selected_languages)}. "
+        "Each URL is counted once in URL Summary. Match Details shows each basis's language."
     )
     input_type = st.radio(
         "Input type", ["Paste URLs", "Upload CSV With Performance"],
@@ -1048,55 +1196,103 @@ def render_coverage_report(final_df):
             f"Removed {removed_total_rows:,} summary row(s): "
             "Grand Total, Report Total, or Stripped URL (Others)."
         )
+    catalog_signature = hashlib.sha256(
+        basis_catalog.to_csv(index=False).encode("utf-8")
+    ).hexdigest()
     if st.button(
         "Create Coverage Report", type="primary", use_container_width=True,
         disabled=prepared_input is None or prepared_input.empty,
     ):
         with st.spinner("Checking URL coverage..."):
-            st.session_state["coverage_report"] = create_coverage_report(prepared_input, basis_catalog)
-            st.session_state["coverage_report_language"] = selected_language
+            report = create_coverage_report(prepared_input, basis_catalog)
+            clear_coverage_reports()
+            st.session_state["coverage_report"] = report
+            st.session_state["coverage_report_languages"] = selected_languages
+            # Rechecks always use the same input, including performance metrics.
+            st.session_state["coverage_report_input"] = prepared_input.copy()
+            st.session_state["coverage_report_catalog_signature"] = catalog_signature
+            st.session_state["coverage_report_revision"] = (
+                st.session_state.get("coverage_report_revision", 0) + 1
+            )
     report = st.session_state.get("coverage_report")
-    if st.session_state.get("coverage_report_language") != selected_language:
-        report = None
     if report is None:
         return
-    url_summary_df, detail_df, coverage_pivot, basis_pivot = report
-    total_urls = len(url_summary_df)
-    covered_urls = int(url_summary_df["Coverage Status"].eq("Covered").sum())
-    uncovered_urls = total_urls - covered_urls
-    coverage_rate = covered_urls / total_urls * 100 if total_urls else 0
-    metric1, metric2, metric3, metric4 = st.columns(4)
-    metric1.metric("URLs Checked", f"{total_urls:,}")
-    metric2.metric("Covered URLs", f"{covered_urls:,}")
-    metric3.metric("No Matching Basis", f"{uncovered_urls:,}")
-    metric4.metric("Coverage Rate", f"{coverage_rate:.1f}%")
-    summary_tab, basis_tab, url_tab, detail_tab = st.tabs([
-        "Coverage Summary", "Basis Performance", "URL Summary", "Match Details",
-    ])
-    with summary_tab:
-        st.dataframe(coverage_pivot, use_container_width=True, hide_index=True)
-    with basis_tab:
-        st.dataframe(basis_pivot, use_container_width=True, hide_index=True)
-        st.caption(
-            "When one URL matches multiple bases, its performance is attributed "
-            "to each matching basis. Use URL Summary for non-duplicated totals."
-        )
-    with url_tab:
-        st.dataframe(url_summary_df, use_container_width=True, hide_index=True)
-    with detail_tab:
-        st.dataframe(detail_df, use_container_width=True, hide_index=True)
-    download1, download2, download3 = st.columns(3)
-    download1.download_button(
-        "Download URL Summary", data=url_summary_df.to_csv(index=False),
-        file_name="coverage_url_summary.csv", mime="text/csv", use_container_width=True,
+    if (
+        st.session_state.get("coverage_report_languages") != selected_languages
+        or st.session_state.get("coverage_report_catalog_signature") != catalog_signature
+    ):
+        st.info("Create a new coverage report for the selected languages and current dataset.")
+        return
+
+    render_coverage_results(report, "URL Summary — Existing Bases", "coverage_original")
+    url_summary_df = report[0]
+    uncovered = url_summary_df.loc[
+        url_summary_df["Coverage Status"].eq("No Matching Basis"), ["URL"]
+    ].reset_index(drop=True)
+    if uncovered.empty:
+        st.success("All submitted URLs have a matching basis.")
+        return
+
+    st.write("---")
+    st.subheader("Add Bases for URLs With No Matching Basis")
+    st.write(
+        "Enter a new basis beside each URL, for example bug*bite. "
+        "Separate multiple bases in one cell with semicolons. "
+        "The next report checks every original URL against existing bases and "
+        "all unique new bases for the selected languages. "
+        "New bases are applied to every selected language for this check."
     )
-    download2.download_button(
-        "Download Basis Report", data=basis_pivot.to_csv(index=False),
-        file_name="coverage_basis_report.csv", mime="text/csv", use_container_width=True,
+    st.caption("New bases are used for this coverage check and do not update the shared dataset.")
+    editor_input = uncovered.assign(**{"New Basis": ""})
+    revision = st.session_state.get("coverage_report_revision", 0)
+    edited_rows = st.data_editor(
+        editor_input, hide_index=True, use_container_width=True,
+        num_rows="fixed", disabled=["URL"],
+        key=f"coverage_new_basis_editor_{revision}",
+        column_config={
+            "URL": st.column_config.TextColumn("No Matching Basis URL", width="large"),
+            "New Basis": st.column_config.TextColumn(
+                "New Basis", width="large", help="Example: bug*bite; heart*health",
+            ),
+        },
     )
-    download3.download_button(
-        "Download Match Details", data=detail_df.to_csv(index=False),
-        file_name="coverage_match_details.csv", mime="text/csv", use_container_width=True,
+    combined_catalog, additions, invalid = add_user_coverage_bases(
+        basis_catalog, edited_rows, selected_languages,
+    )
+    if invalid:
+        st.warning("These entries contain no searchable words and were ignored: " + ", ".join(invalid))
+    st.caption(
+        f"{additions['normalized_basis'].nunique():,} unique new basis/bases "
+        f"across {len(additions):,} language/basis pairs ready to check."
+    )
+    additions_signature = additions.to_csv(index=False)
+    if st.button(
+        "Check Coverage With Existing and New Bases", type="primary",
+        use_container_width=True, disabled=additions.empty,
+        key="coverage_recheck_button",
+    ):
+        with st.spinner("Checking coverage with existing and new bases..."):
+            st.session_state["coverage_recheck_report"] = create_coverage_report(
+                st.session_state["coverage_report_input"], combined_catalog,
+            )
+            st.session_state["coverage_recheck_signature"] = additions_signature
+    revised_report = st.session_state.get("coverage_recheck_report")
+    if revised_report is None:
+        return
+    if st.session_state.get("coverage_recheck_signature") != additions_signature:
+        st.info("New basis entries changed. Run the coverage check again to refresh the second report.")
+        return
+    st.write("---")
+    original_covered = int(url_summary_df["Coverage Status"].eq("Covered").sum())
+    revised_covered = int(revised_report[0]["Coverage Status"].eq("Covered").sum())
+    st.info(f"{revised_covered - original_covered:,} additional URL(s) now have a matching basis.")
+    render_coverage_results(
+        revised_report, "URL Summary — Existing and New Bases", "coverage_rechecked",
+    )
+    st.download_button(
+        "Download New Bases", data=additions[["basis", "language_code"]].to_csv(index=False),
+        file_name="coverage_new_bases.csv", mime="text/csv", use_container_width=True,
+        key="coverage_download_new_bases",
     )
 
 
@@ -1305,8 +1501,7 @@ def render_pending_dataset():
                         st.session_state.get("authenticated_username", "Unknown"),
                     )
                 clear_pending_dataset()
-                st.session_state.pop("coverage_report", None)
-                st.session_state.pop("coverage_report_language", None)
+                clear_coverage_reports()
                 # The replacement workbook may have a different set of admins.
                 st.session_state.pop("database_admin_name", None)
                 make_basis_catalog.clear()

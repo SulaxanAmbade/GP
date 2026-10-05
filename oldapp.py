@@ -1,15 +1,9 @@
-"""Global Patterns with ML Keyword Review.
-
-Install: python -m pip install streamlit pandas scikit-learn openpyxl xlrd
-Run: python -m streamlit run global_patterns.py
-Configure users as in the existing app. Train with your approved examples.
-"""
-
 import os
 import re
 import sqlite3
 import hmac
 import json
+import hashlib
 from html import escape
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -679,16 +673,28 @@ def domains_match(url_domain, pattern_domain):
     )
 
 
+def normalize_coverage_basis(basis):
+    """Preserve wildcard gaps and exact ~word~ locks; ignore backslashes."""
+    raw_basis = unquote(str(basis)).replace("\\", "")
+    tokens = []
+    for part in re.split(r"(~[^~]*~|\*)", raw_basis):
+        if part == "*":
+            if tokens and tokens[-1] != "*":
+                tokens.append("*")
+        elif part.startswith("~") and part.endswith("~") and len(part) >= 2:
+            # Lock each word of a phrase; the phrase's words stay adjacent.
+            tokens.extend(f"~{word}~" for word in normalize_search_text(part[1:-1]).split())
+        else:
+            tokens.extend(normalize_search_text(part).split())
+    if tokens and tokens[-1] == "*":
+        tokens.pop()
+    return " ".join(tokens)
+
+
 def basis_matches_url(normalized_basis, searchable_url):
-    basis_words = normalized_basis.split()
-    url_words = searchable_url.split()
-    if not basis_words or len(basis_words) > len(url_words):
-        return False
-    size = len(basis_words)
-    return any(
-        all(word_forms_match(a, b) for a, b in zip(basis_words, url_words[start:start + size]))
-        for start in range(len(url_words) - size + 1)
-    )
+    return bool(_coverage_match_ids(
+        searchable_url, _coverage_basis_index((normalized_basis,)),
+    ))
 
 
 # =============================================================
@@ -706,7 +712,7 @@ def make_basis_catalog(pattern_df):
     ]].itertuples(index=False, name=None):
         domain, basis = split_domain_basis(pattern)
         normalized_domain = normalize_domain(domain)
-        normalized_basis = normalize_search_text(basis)
+        normalized_basis = normalize_coverage_basis(basis)
         language_code = str(language).strip().lower()
         if (
             not normalized_domain or not normalized_basis or not language_code
@@ -793,23 +799,30 @@ def remove_report_total_rows(input_df):
 # =============================================================
 @lru_cache(maxsize=50000)
 def _coverage_word_forms(word):
+    """URL-side forms only: exact token plus common singular spellings."""
     forms = {word}
     if len(word) > 3:
         if word.endswith("ies"):
             forms.add(word[:-3] + "y")
-        if word.endswith("s"):
             forms.add(word[:-1])
-        if word.endswith("es"):
-            forms.update((word[:-2], word[:-1]))
+        elif word.endswith(("sses", "shes", "ches", "xes", "zes")):
+            forms.add(word[:-2])
+        elif word in {"buses", "statuses"}:
+            forms.add(word[:-2])
+        elif word.endswith("s") and not word.endswith(("ss", "us", "is")):
+            forms.add(word[:-1])
     return frozenset(forms)
 
 
 @lru_cache(maxsize=4)
 def _coverage_basis_index(bases):
-    """Build a shared-prefix index; cache keys include actual basis values."""
+    """Build a shared-prefix index with optional word-gap wildcard states."""
     children = [{}]
     form_edges = [{}]
+    exact_edges = [{}]
     terminals = [[]]
+    gap_edges = {}
+    gap_nodes = set()
     for basis_id, basis in enumerate(bases):
         node = 0
         words = basis.split()
@@ -822,22 +835,36 @@ def _coverage_basis_index(bases):
                 children[node][word] = child
                 children.append({})
                 form_edges.append({})
+                exact_edges.append({})
                 terminals.append([])
-                for form in _coverage_word_forms(word):
-                    form_edges[node].setdefault(form, set()).add(child)
+                if word == "*":
+                    gap_edges[node] = child
+                    gap_nodes.add(child)
+                elif word.startswith("~") and word.endswith("~"):
+                    exact_edges[node].setdefault(word[1:-1], set()).add(child)
+                else:
+                    # Basis words stay literal. Singular alternatives are
+                    # generated only from the URL, so word cannot match words.
+                    form_edges[node].setdefault(word, set()).add(child)
             node = child
         terminals[node].append(basis_id)
-    return form_edges, terminals
+    return form_edges, exact_edges, terminals, gap_edges, gap_nodes
 
 
 def _coverage_match_ids(searchable_url, index):
-    form_edges, terminals = index
+    form_edges, exact_edges, terminals, gap_edges, gap_nodes = index
     active = set()
     matches = set()
     for word in searchable_url.split():
         forms = _coverage_word_forms(word)
-        next_active = set()
-        for node in active | {0}:
+        starts = active | {0}
+        # Enter a gap without consuming a word. Gap states remain active while
+        # intervening URL words are skipped, and can match the next term now.
+        starts |= {gap_edges[node] for node in tuple(starts) if node in gap_edges}
+        next_active = starts & gap_nodes
+        for node in starts:
+            # Locked terms use the original URL token, never a singular form.
+            next_active.update(exact_edges[node].get(word, ()))
             edges = form_edges[node]
             for form in forms:
                 next_active.update(edges.get(form, ()))
@@ -866,10 +893,9 @@ def create_coverage_report(input_df, basis_catalog):
         "Keyword Impressions", "Revenue",
     ]
     if basis_catalog.empty:
-        raise ValueError("Select a language with at least one usable basis.")
-    if basis_catalog["language_code"].nunique(dropna=False) != 1:
-        raise ValueError("Filter the basis catalog to one language first.")
-    selected_language = str(basis_catalog["language_code"].iloc[0])
+        raise ValueError("Select at least one language with usable bases.")
+    selected_languages = sorted(basis_catalog["language_code"].astype(str).unique())
+    language_label = ", ".join(selected_languages)
     prepared, _ = remove_report_total_rows(input_df)
     prepared = prepared.copy()
     prepared["URL"] = prepared["URL"].astype(str).str.strip()
@@ -901,11 +927,11 @@ def create_coverage_report(input_df, basis_catalog):
             path_matches[searchable_url] = ids
         if not ids:
             summary_rows.append((
-                url, domain, selected_language, "No Matching Basis", 0,
+                url, domain, language_label, "No Matching Basis", 0,
                 "No Matching Basis", impressions, revenue,
             ))
             detail_rows.append((
-                url, domain, selected_language, "No Matching Basis",
+                url, domain, language_label, "No Matching Basis",
                 "No Matching Basis", "", "", "", impressions, revenue,
             ))
             continue
@@ -917,8 +943,9 @@ def create_coverage_report(input_df, basis_catalog):
                 url, domain, language, "Covered", basis, source_domain,
                 pattern_id, priority, impressions, revenue,
             ))
+        matched_bases = list(dict.fromkeys(matched_bases))
         summary_rows.append((
-            url, domain, selected_language, "Covered", len(ids),
+            url, domain, language_label, "Covered", len(matched_bases),
             " | ".join(matched_bases), impressions, revenue,
         ))
     url_summary_df = pd.DataFrame(summary_rows, columns=summary_columns)
@@ -947,6 +974,102 @@ def create_coverage_report(input_df, basis_catalog):
     return url_summary_df, detail_df, coverage_pivot, basis_pivot
 
 
+def add_user_coverage_bases(basis_catalog, edited_rows, selected_languages):
+    """Combine existing bases with unique user additions for this report only."""
+    if isinstance(selected_languages, str):
+        selected_languages = [selected_languages]
+    selected_languages = sorted(set(selected_languages))
+    if (not selected_languages or basis_catalog.empty
+            or not basis_catalog["language_code"].isin(selected_languages).all()):
+        raise ValueError("Use the basis catalog for the report's selected languages.")
+    existing = set(zip(basis_catalog["language_code"], basis_catalog["normalized_basis"]))
+    added_rows = []
+    invalid = []
+    for value in edited_rows["New Basis"]:
+        if pd.isna(value):
+            continue
+        # Several bases can be entered in one cell, separated by semicolons.
+        for raw_basis in re.split(r"[;\n]+", str(value)):
+            basis = raw_basis.strip().strip("*").strip()
+            if not basis:
+                continue
+            normalized = normalize_coverage_basis(basis)
+            if not normalized:
+                invalid.append(raw_basis.strip())
+                continue
+            for language in selected_languages:
+                if (language, normalized) in existing:
+                    continue
+                existing.add((language, normalized))
+                added_rows.append({
+                    "domain": "User Added", "normalized_domain": "",
+                    "basis": basis, "normalized_basis": normalized,
+                    "language_code": language,
+                    "url_pattern_id": f"user-added-{len(added_rows) + 1}",
+                    "priority": "",
+                })
+    additions = pd.DataFrame(added_rows, columns=basis_catalog.columns)
+    combined = pd.concat([basis_catalog, additions], ignore_index=True)
+    combined = combined.sort_values(
+        "normalized_basis", key=lambda values: values.str.len(), ascending=False,
+        kind="stable",
+    ).reset_index(drop=True)
+    return combined, additions, invalid
+
+
+def render_coverage_results(report, title, key_prefix):
+    """Show url_summary_df directly, with optional aggregate and match details."""
+    url_summary_df, detail_df, coverage_pivot, basis_pivot = report
+    st.subheader(title)
+    total_urls = len(url_summary_df)
+    covered_urls = int(url_summary_df["Coverage Status"].eq("Covered").sum())
+    metric1, metric2, metric3, metric4 = st.columns(4)
+    metric1.metric("URLs Checked", f"{total_urls:,}")
+    metric2.metric("Covered URLs", f"{covered_urls:,}")
+    metric3.metric("No Matching Basis", f"{total_urls - covered_urls:,}")
+    metric4.metric("Coverage Rate", f"{covered_urls / total_urls * 100 if total_urls else 0:.1f}%")
+    st.dataframe(url_summary_df, use_container_width=True, hide_index=True)
+    st.download_button(
+        "Download URL Summary", data=url_summary_df.to_csv(index=False),
+        file_name=f"{key_prefix}_url_summary.csv", mime="text/csv",
+        use_container_width=True, key=f"{key_prefix}_download_summary",
+    )
+    with st.expander("Coverage Summary, Basis Performance, and Match Details", expanded=False):
+        summary_tab, basis_tab, detail_tab = st.tabs([
+            "Coverage Summary", "Basis Performance", "Match Details",
+        ])
+        with summary_tab:
+            st.dataframe(coverage_pivot, use_container_width=True, hide_index=True)
+        with basis_tab:
+            st.dataframe(basis_pivot, use_container_width=True, hide_index=True)
+            st.caption(
+                "A URL's performance is attributed to each matching basis. "
+                "Use URL Summary for non-duplicated totals."
+            )
+        with detail_tab:
+            st.dataframe(detail_df, use_container_width=True, hide_index=True)
+        download1, download2 = st.columns(2)
+        download1.download_button(
+            "Download Basis Report", data=basis_pivot.to_csv(index=False),
+            file_name=f"{key_prefix}_basis_report.csv", mime="text/csv",
+            use_container_width=True, key=f"{key_prefix}_download_basis",
+        )
+        download2.download_button(
+            "Download Match Details", data=detail_df.to_csv(index=False),
+            file_name=f"{key_prefix}_match_details.csv", mime="text/csv",
+            use_container_width=True, key=f"{key_prefix}_download_details",
+        )
+
+
+def clear_coverage_reports():
+    for key in (
+        "coverage_report", "coverage_report_language", "coverage_report_languages", "coverage_report_input",
+        "coverage_report_catalog_signature", "coverage_recheck_report",
+        "coverage_recheck_signature",
+    ):
+        st.session_state.pop(key, None)
+
+
 # =============================================================
 # COVERAGE REPORT UI
 # =============================================================
@@ -955,8 +1078,12 @@ def render_coverage_report(final_df):
     st.write(
         "Check URLs against bases from the active global pattern dataset. "
         "Matching is global and does not compare domains. A basis matches when "
-        "its normalized words appear together in the URL path, including common "
-        "singular/plural variations."
+        "its complete words appear in order in the URL path. Plural URL words "
+        "can match singular bases, but singular URL words cannot match plural bases. "
+        "Use * to allow intervening words: "
+        "word1*word4 matches word1-word2-word3-word4. "
+        "Wrap a word in ~ to lock it: sharp*~eye~ matches sharp-eye, "
+        "but not sharp-eyes. Backslashes in bases are ignored."
     )
     if final_df.empty:
         st.warning("Upload a shared global pattern dataset before creating a coverage report.")
@@ -972,16 +1099,30 @@ def render_coverage_report(final_df):
     if not available_languages:
         st.warning("No language codes are available in the active dataset.")
         return
-    selected_language = st.selectbox(
-        "Language code", available_languages, format_func=lambda value: value.upper(),
-        key="coverage_language_code",
-        help="Only bases with this language code will be checked against the submitted URLs.",
+    language_key = "coverage_language_codes"
+    if language_key in st.session_state:
+        saved = st.session_state[language_key]
+        valid = [language for language in saved if language in available_languages]
+        if valid != saved:
+            st.session_state[language_key] = valid
+    selected_languages = st.multiselect(
+        "Language codes", available_languages,
+        default=(None if language_key in st.session_state else
+                 (["en"] if "en" in available_languages else available_languages[:1])),
+        format_func=lambda value: value.upper(), key=language_key,
+        help="Choose one or more languages. A URL is covered if any selected language's basis matches.",
     )
+    selected_languages = tuple(sorted(selected_languages))
+    if not selected_languages:
+        st.info("Select at least one language code before entering URLs.")
+        return
     basis_catalog = complete_basis_catalog.loc[
-        complete_basis_catalog["language_code"].eq(selected_language)
+        complete_basis_catalog["language_code"].isin(selected_languages)
     ].copy()
     st.caption(
-        f"{len(basis_catalog):,} unique bases are available for language {selected_language.upper()}."
+        f"{len(basis_catalog):,} language/basis pairs are available for "
+        f"{', '.join(language.upper() for language in selected_languages)}. "
+        "Each URL is counted once in URL Summary. Match Details shows each basis's language."
     )
     input_type = st.radio(
         "Input type", ["Paste URLs", "Upload CSV With Performance"],
@@ -1055,55 +1196,103 @@ def render_coverage_report(final_df):
             f"Removed {removed_total_rows:,} summary row(s): "
             "Grand Total, Report Total, or Stripped URL (Others)."
         )
+    catalog_signature = hashlib.sha256(
+        basis_catalog.to_csv(index=False).encode("utf-8")
+    ).hexdigest()
     if st.button(
         "Create Coverage Report", type="primary", use_container_width=True,
         disabled=prepared_input is None or prepared_input.empty,
     ):
         with st.spinner("Checking URL coverage..."):
-            st.session_state["coverage_report"] = create_coverage_report(prepared_input, basis_catalog)
-            st.session_state["coverage_report_language"] = selected_language
+            report = create_coverage_report(prepared_input, basis_catalog)
+            clear_coverage_reports()
+            st.session_state["coverage_report"] = report
+            st.session_state["coverage_report_languages"] = selected_languages
+            # Rechecks always use the same input, including performance metrics.
+            st.session_state["coverage_report_input"] = prepared_input.copy()
+            st.session_state["coverage_report_catalog_signature"] = catalog_signature
+            st.session_state["coverage_report_revision"] = (
+                st.session_state.get("coverage_report_revision", 0) + 1
+            )
     report = st.session_state.get("coverage_report")
-    if st.session_state.get("coverage_report_language") != selected_language:
-        report = None
     if report is None:
         return
-    url_summary_df, detail_df, coverage_pivot, basis_pivot = report
-    total_urls = len(url_summary_df)
-    covered_urls = int(url_summary_df["Coverage Status"].eq("Covered").sum())
-    uncovered_urls = total_urls - covered_urls
-    coverage_rate = covered_urls / total_urls * 100 if total_urls else 0
-    metric1, metric2, metric3, metric4 = st.columns(4)
-    metric1.metric("URLs Checked", f"{total_urls:,}")
-    metric2.metric("Covered URLs", f"{covered_urls:,}")
-    metric3.metric("No Matching Basis", f"{uncovered_urls:,}")
-    metric4.metric("Coverage Rate", f"{coverage_rate:.1f}%")
-    summary_tab, basis_tab, url_tab, detail_tab = st.tabs([
-        "Coverage Summary", "Basis Performance", "URL Summary", "Match Details",
-    ])
-    with summary_tab:
-        st.dataframe(coverage_pivot, use_container_width=True, hide_index=True)
-    with basis_tab:
-        st.dataframe(basis_pivot, use_container_width=True, hide_index=True)
-        st.caption(
-            "When one URL matches multiple bases, its performance is attributed "
-            "to each matching basis. Use URL Summary for non-duplicated totals."
-        )
-    with url_tab:
-        st.dataframe(url_summary_df, use_container_width=True, hide_index=True)
-    with detail_tab:
-        st.dataframe(detail_df, use_container_width=True, hide_index=True)
-    download1, download2, download3 = st.columns(3)
-    download1.download_button(
-        "Download URL Summary", data=url_summary_df.to_csv(index=False),
-        file_name="coverage_url_summary.csv", mime="text/csv", use_container_width=True,
+    if (
+        st.session_state.get("coverage_report_languages") != selected_languages
+        or st.session_state.get("coverage_report_catalog_signature") != catalog_signature
+    ):
+        st.info("Create a new coverage report for the selected languages and current dataset.")
+        return
+
+    render_coverage_results(report, "URL Summary — Existing Bases", "coverage_original")
+    url_summary_df = report[0]
+    uncovered = url_summary_df.loc[
+        url_summary_df["Coverage Status"].eq("No Matching Basis"), ["URL"]
+    ].reset_index(drop=True)
+    if uncovered.empty:
+        st.success("All submitted URLs have a matching basis.")
+        return
+
+    st.write("---")
+    st.subheader("Add Bases for URLs With No Matching Basis")
+    st.write(
+        "Enter a new basis beside each URL, for example bug*bite. "
+        "Separate multiple bases in one cell with semicolons. "
+        "The next report checks every original URL against existing bases and "
+        "all unique new bases for the selected languages. "
+        "New bases are applied to every selected language for this check."
     )
-    download2.download_button(
-        "Download Basis Report", data=basis_pivot.to_csv(index=False),
-        file_name="coverage_basis_report.csv", mime="text/csv", use_container_width=True,
+    st.caption("New bases are used for this coverage check and do not update the shared dataset.")
+    editor_input = uncovered.assign(**{"New Basis": ""})
+    revision = st.session_state.get("coverage_report_revision", 0)
+    edited_rows = st.data_editor(
+        editor_input, hide_index=True, use_container_width=True,
+        num_rows="fixed", disabled=["URL"],
+        key=f"coverage_new_basis_editor_{revision}",
+        column_config={
+            "URL": st.column_config.TextColumn("No Matching Basis URL", width="large"),
+            "New Basis": st.column_config.TextColumn(
+                "New Basis", width="large", help="Example: bug*bite; heart*health",
+            ),
+        },
     )
-    download3.download_button(
-        "Download Match Details", data=detail_df.to_csv(index=False),
-        file_name="coverage_match_details.csv", mime="text/csv", use_container_width=True,
+    combined_catalog, additions, invalid = add_user_coverage_bases(
+        basis_catalog, edited_rows, selected_languages,
+    )
+    if invalid:
+        st.warning("These entries contain no searchable words and were ignored: " + ", ".join(invalid))
+    st.caption(
+        f"{additions['normalized_basis'].nunique():,} unique new basis/bases "
+        f"across {len(additions):,} language/basis pairs ready to check."
+    )
+    additions_signature = additions.to_csv(index=False)
+    if st.button(
+        "Check Coverage With Existing and New Bases", type="primary",
+        use_container_width=True, disabled=additions.empty,
+        key="coverage_recheck_button",
+    ):
+        with st.spinner("Checking coverage with existing and new bases..."):
+            st.session_state["coverage_recheck_report"] = create_coverage_report(
+                st.session_state["coverage_report_input"], combined_catalog,
+            )
+            st.session_state["coverage_recheck_signature"] = additions_signature
+    revised_report = st.session_state.get("coverage_recheck_report")
+    if revised_report is None:
+        return
+    if st.session_state.get("coverage_recheck_signature") != additions_signature:
+        st.info("New basis entries changed. Run the coverage check again to refresh the second report.")
+        return
+    st.write("---")
+    original_covered = int(url_summary_df["Coverage Status"].eq("Covered").sum())
+    revised_covered = int(revised_report[0]["Coverage Status"].eq("Covered").sum())
+    st.info(f"{revised_covered - original_covered:,} additional URL(s) now have a matching basis.")
+    render_coverage_results(
+        revised_report, "URL Summary — Existing and New Bases", "coverage_rechecked",
+    )
+    st.download_button(
+        "Download New Bases", data=additions[["basis", "language_code"]].to_csv(index=False),
+        file_name="coverage_new_bases.csv", mime="text/csv", use_container_width=True,
+        key="coverage_download_new_bases",
     )
 
 
@@ -1312,8 +1501,7 @@ def render_pending_dataset():
                         st.session_state.get("authenticated_username", "Unknown"),
                     )
                 clear_pending_dataset()
-                st.session_state.pop("coverage_report", None)
-                st.session_state.pop("coverage_report_language", None)
+                clear_coverage_reports()
                 # The replacement workbook may have a different set of admins.
                 st.session_state.pop("database_admin_name", None)
                 make_basis_catalog.clear()
@@ -1493,608 +1681,6 @@ def global_pattern_dashboard_page():
 
 
 # =============================================================
-# ML KEYWORD REVIEW
-# Dependencies: scikit-learn, openpyxl (Excel); xlrd for legacy .xls.
-# Training snapshots are JSON, never executable pickle uploads.
-# =============================================================
-from collections import Counter
-from difflib import SequenceMatcher
-from io import BytesIO
-import hashlib
-import unicodedata
-
-KW_RESULT_COLUMNS = ["Basis", "Original Keyword", "Suggested Replacement"]
-KW_EVENT_TERMS = {"black", "friday", "prime", "day", "cyber", "monday"}
-KW_INTENT_TERMS = {
-    "buy", "shop", "find", "order", "online", "best", "top", "deals", "deal",
-    "sale", "sales", "offers", "offer", "discount", "discounts", "clearance",
-    "for", "the", "a", "an", "of", "on", "in", "and", "to", "with", "near", "me",
-}
-
-
-def kw_text(value):
-    if value is None or (not isinstance(value, (list, dict)) and pd.isna(value)):
-        return ""
-    return re.sub(r"\s+", " ", str(value)).strip()
-
-
-def kw_normalize(value):
-    value = unicodedata.normalize("NFKC", kw_text(value)).casefold()
-    return " ".join(re.findall(r"[^\W_]+", value, flags=re.UNICODE))
-
-
-def kw_title(value, language="EN"):
-    # English title style: main words capitalized, connecting words lowercase.
-    # First/last words and words after a hyphen are capitalized; brand casing remains intact.
-    minor_words = {"a", "an", "and", "as", "at", "but", "by", "for", "in",
-                   "nor", "of", "on", "or", "per", "the", "to", "via", "with"}
-    canonical_brands = {"iphone": "iPhone"}
-    english = re.split(r"[-_]", kw_text(language).upper())[0] == "EN"
-    words = kw_text(value).split()
-    formatted = []
-    for index, word in enumerate(words):
-        def capitalize(match):
-            token = match.group()
-            lower = token.casefold()
-            after_separator = match.start() > 0 and word[match.start() - 1] in "-/"
-            if lower in canonical_brands:
-                return canonical_brands[lower]
-            if english and lower in minor_words and index not in (0, len(words) - 1) and not after_separator:
-                return lower
-            if token.isupper() and len(token) > 1:
-                return token  # Acronyms such as AI, WLAN, IPF, and product codes.
-            if token[:1].islower() and any(c.isupper() for c in token[1:]):
-                return token  # Existing brand spelling such as eBay.
-            return token[:1].upper() + token[1:]
-        formatted.append(re.sub(r"[^\W_]+(?:['’][^\W_]+)?", capitalize, word))
-    return " ".join(formatted)
-
-
-def kw_basis_words(basis):
-    value = unquote(kw_text(basis))
-    value = re.sub(r"patternkeywords\.global\.(?:promote|[a-z]{2})(?:\.\d+\.setid)?", " ", value, flags=re.I)
-    value = re.sub(r"(?:https?://)?(?:www\.)?[\w-]+(?:\.[\w-]+)+", " ", value)
-    value = re.sub(r"lang=[a-z-]+", " ", value, flags=re.I)
-    return kw_normalize(value).split()
-
-
-def kw_topic(basis, explicit=""):
-    if kw_text(explicit):
-        return kw_text(explicit)
-    words = kw_basis_words(basis)
-    core = [w for w in words if w not in KW_INTENT_TERMS | KW_EVENT_TERMS and not w.isdigit()]
-    return kw_title(" ".join(core or words))
-
-
-def kw_intent_tags(value):
-    words = set(kw_normalize(value).split())
-    commerce = {"buy", "shop", "order", "deals", "deal", "sale", "offers", "offer", "discounts",
-                "discount", "clearance", "kaufen", "angebote", "rabatte", "offerte", "comprare",
-                "comprar", "ofertas", "acheter", "soldes", "achats"}
-    return "shopping commercial" if words & commerce else ""
-
-
-def kw_levenshtein_similarity(first, second):
-    a, b = kw_normalize(first), kw_normalize(second)
-    if a == b:
-        return 100.0
-    if not a or not b:
-        return 0.0
-    if len(a) < len(b):
-        a, b = b, a
-    previous = list(range(len(b) + 1))
-    for i, ca in enumerate(a, 1):
-        current = [i]
-        for j, cb in enumerate(b, 1):
-            current.append(min(current[-1] + 1, previous[j] + 1, previous[j - 1] + (ca != cb)))
-        previous = current
-    return 100.0 * (1.0 - previous[-1] / max(len(a), len(b)))
-
-
-def kw_pair_conflict(first, second, lev_threshold=80, overlap_threshold=50):
-    a, b = kw_normalize(first), kw_normalize(second)
-    if a == b:
-        return True
-    wa, wb = a.split(), b.split()
-    if not wa or not wb:
-        return False
-    overlap = sum((Counter(wa) & Counter(wb)).values()) / min(len(wa), len(wb)) * 100
-    sequence = SequenceMatcher(None, wa, wb, autojunk=False).ratio()
-    same_positions = sum(x == y for x, y in zip(wa, wb))
-    one_term_changed = len(wa) == len(wb) and same_positions >= len(wa) - 1
-    return (overlap > overlap_threshold or sequence >= 0.8 or one_term_changed
-            or kw_levenshtein_similarity(a, b) >= lev_threshold)
-
-
-def kw_is_valid(keyword, max_chars=42, min_words=3, exclusions=(), allow_comparison=False, language="EN"):
-    keyword = kw_text(keyword)
-    words = kw_normalize(keyword).split()
-    if not keyword or len(keyword) > max_chars or len(keyword.split()) < min_words:
-        return False
-    if keyword != kw_title(keyword, language):
-        return False
-    if not allow_comparison and set(words) & {"vs", "versus", "compare", "comparison"}:
-        return False
-    if any(kw_normalize(term) in kw_normalize(keyword) for term in exclusions if kw_text(term)):
-        return False
-    return True
-
-
-def kw_relevant(candidate, basis, topic):
-    # Lexical guard, not a claim of medical or semantic verification.
-    words = set(kw_normalize(candidate).split())
-    anchors = set(kw_normalize(topic).split()) - KW_INTENT_TERMS
-    if not anchors or not anchors.issubset(words):
-        return False
-    events = set(kw_basis_words(basis)) & KW_EVENT_TERMS
-    return events.issubset(words)
-
-
-def kw_validation_reasons(keyword, basis, topic, max_chars=42, min_words=3,
-                          exclusions=(), allow_comparison=False, language="EN"):
-    keyword = kw_text(keyword)
-    words = set(kw_normalize(keyword).split())
-    reasons = []
-    if not keyword:
-        reasons.append("The replacement is empty.")
-    if len(keyword) > max_chars:
-        reasons.append(f"Character count is {len(keyword)}; maximum allowed is {max_chars} (including spaces).")
-    if len(keyword.split()) < min_words:
-        reasons.append(f"Word count is {len(keyword.split())}; minimum required is {min_words}.")
-    expected = kw_title(keyword, language)
-    if keyword != expected:
-        reasons.append(f'Title Case check: expected "{expected}".')
-    comparison = sorted(words & {"vs", "versus", "compare", "comparison"})
-    if comparison and not allow_comparison:
-        reasons.append("Comparison wording is disabled; found: " + ", ".join(comparison) + ".")
-    excluded = [kw_text(term) for term in exclusions
-                if kw_text(term) and kw_normalize(term) in kw_normalize(keyword)]
-    if excluded:
-        reasons.append("Contains excluded term(s): " + ", ".join(excluded) + ".")
-    anchors = set(kw_normalize(topic).split()) - KW_INTENT_TERMS
-    if not anchors:
-        reasons.append("No usable topic words could be extracted from this basis. Enter a Readable Topic.")
-    elif not anchors.issubset(words):
-        reasons.append(f'Topic-word check for "{topic}": missing ' + ", ".join(sorted(anchors - words)) +
-                       ". This checks word presence, not meaning; a related keyword may still be suitable.")
-    events = set(kw_basis_words(basis)) & KW_EVENT_TERMS
-    if not events.issubset(words):
-        reasons.append("Event-word check: missing " + ", ".join(sorted(events - words)) + " from the basis.")
-    return reasons
-
-
-def kw_pair_reasons(first, second, lev_threshold=80, overlap_threshold=50):
-    a, b = kw_normalize(first), kw_normalize(second)
-    if a == b:
-        return ["Exact duplicate after ignoring case, punctuation, and extra spaces (100% similarity)."]
-    wa, wb = a.split(), b.split()
-    if not wa or not wb:
-        return []
-    shared = Counter(wa) & Counter(wb)
-    shared_count = sum(shared.values())
-    denominator = min(len(wa), len(wb))
-    overlap = shared_count / denominator * 100
-    sequence = SequenceMatcher(None, wa, wb, autojunk=False).ratio() * 100
-    same_positions = sum(x == y for x, y in zip(wa, wb))
-    levenshtein = kw_levenshtein_similarity(a, b)
-    reasons = []
-    if overlap > overlap_threshold:
-        reasons.append(f"Word overlap is {overlap:.1f}%, above the {overlap_threshold}% limit "
-            f"({shared_count} shared words / {denominator} words in the shorter keyword; "
-            "shared words: " + ", ".join(sorted(shared)) + ").")
-    if sequence >= 80:
-        reasons.append(f"Word-sequence similarity is {sequence:.1f}%, meeting the 80% threshold "
-                       "for nearly identical word order.")
-    if len(wa) == len(wb) and same_positions >= len(wa) - 1:
-        changes = [f'"{x}" → "{y}"' for x, y in zip(wa, wb) if x != y]
-        if changes:
-            reasons.append("Same word order with only one term changed: " + ", ".join(changes) + ".")
-        else:
-            reasons.append("The normalized words appear in exactly the same order.")
-    if levenshtein >= lev_threshold:
-        reasons.append(f"Levenshtein character similarity is {levenshtein:.1f}%, "
-                       f"meeting the {lev_threshold}% threshold.")
-    return reasons
-
-
-def kw_initialize_database():
-    with get_connection() as conn:
-        conn.execute("""CREATE TABLE IF NOT EXISTS keyword_examples (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, basis TEXT NOT NULL,
-            keyword TEXT NOT NULL, language TEXT NOT NULL, topic TEXT NOT NULL,
-            basis_key TEXT NOT NULL, keyword_key TEXT NOT NULL,
-            approved_by TEXT NOT NULL, approved_at TEXT NOT NULL,
-            UNIQUE(basis_key, keyword_key, language, topic))""")
-        conn.execute("""CREATE TABLE IF NOT EXISTS keyword_training_versions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT, trained_at TEXT NOT NULL,
-            trained_by TEXT NOT NULL, examples_json TEXT NOT NULL,
-            example_count INTEGER NOT NULL)""")
-
-
-def kw_load_examples():
-    with get_connection() as conn:
-        return pd.read_sql_query(
-            "SELECT basis, keyword, language, topic FROM keyword_examples ORDER BY id", conn
-        ).to_dict("records")
-
-
-def kw_store_examples(records, username):
-    timestamp = datetime.now().isoformat(timespec="seconds")
-    with get_connection() as conn:
-        before = conn.total_changes
-        for row in records:
-            basis, keyword = kw_text(row.get("basis")), kw_text(row.get("keyword"))
-            if not basis or not keyword:
-                continue
-            language = kw_text(row.get("language", "EN")).upper() or "EN"
-            topic = kw_topic(basis, row.get("topic", ""))
-            conn.execute("""INSERT OR IGNORE INTO keyword_examples
-                (basis, keyword, language, topic, basis_key, keyword_key, approved_by, approved_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (basis, keyword, language, topic, kw_normalize(basis), kw_normalize(keyword), username, timestamp))
-        return conn.total_changes - before
-
-
-def kw_active_version():
-    with get_connection() as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute("SELECT * FROM keyword_training_versions ORDER BY id DESC LIMIT 1").fetchone()
-        return dict(row) if row else None
-
-
-@st.cache_resource(show_spinner=False, max_entries=8)
-def kw_fit_model(examples_json):
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    records = json.loads(examples_json)
-    if not records:
-        raise ValueError("Add approved training examples first.")
-    documents = [" ".join((r["basis"], r["topic"], r["keyword"],
-        kw_intent_tags(r["basis"] + " " + r["keyword"]))) for r in records]
-    vectorizer = TfidfVectorizer(analyzer="char_wb", ngram_range=(3, 5), lowercase=True)
-    matrix = vectorizer.fit_transform(documents)
-    return records, vectorizer, matrix
-
-
-def kw_train(username):
-    examples = kw_load_examples()
-    if not examples:
-        raise ValueError("Add approved examples before training.")
-    if len(examples) > 50000:
-        raise ValueError("The first version supports up to 50,000 approved examples.")
-    snapshot = json.dumps(examples, ensure_ascii=False, sort_keys=True)
-    # Fit before committing the active version, so a failure leaves the previous one usable.
-    kw_fit_model(snapshot)
-    with get_connection() as conn:
-        cursor = conn.execute("""INSERT INTO keyword_training_versions
-            (trained_at, trained_by, examples_json, example_count) VALUES (?, ?, ?, ?)""",
-            (datetime.now().isoformat(timespec="seconds"), username, snapshot, len(examples)))
-        return cursor.lastrowid
-
-
-def kw_candidates(model_json, basis, original, language, topic, reference_keywords=()):
-    candidates = [(kw_title(original, language), 1.0)]
-    source_records = []
-    if model_json:
-        from sklearn.metrics.pairwise import cosine_similarity
-        records, vectorizer, matrix = kw_fit_model(model_json)
-        query = vectorizer.transform([" ".join((basis, topic, original, kw_intent_tags(basis + " " + original)))])
-        scores = cosine_similarity(query, matrix).ravel()
-        # Filter language BEFORE taking the best examples.
-        eligible = [i for i, r in enumerate(records) if r["language"] == language]
-        for index in sorted(eligible, key=lambda i: -scores[i])[:100]:
-            if scores[index] >= 0.08:
-                source_records.append((records[index], float(scores[index])))
-    for keyword in reference_keywords:
-        source_records.append(({"basis": basis, "keyword": keyword, "topic": topic, "language": language}, 1.0))
-    for source, score in source_records:
-        keyword = source["keyword"]
-        if kw_relevant(keyword, basis, topic):
-            candidates.append((kw_title(keyword, language), score))
-        anchor = source["topic"]
-        # Adapt only a complete contiguous topic phrase; never replace single arbitrary words.
-        tokens = kw_text(anchor).split()
-        if tokens:
-            pattern = r"(?<!\w)" + r"[\s\-/]+".join(re.escape(t) for t in tokens) + r"(?!\w)"
-            adapted, substitutions = re.subn(pattern, lambda m: topic, keyword, flags=re.I)
-            if substitutions and kw_relevant(adapted, basis, topic):
-                candidates.append((kw_title(adapted, language), score * 0.9))
-    unique = {}
-    for keyword, score in candidates:
-        if keyword not in unique or score > unique[keyword]:
-            unique[keyword] = score
-    return sorted(unique.items(), key=lambda item: (-item[1], len(item[0]), item[0]))
-
-
-def kw_review(records, model_json=None, lev_threshold=80, overlap_threshold=50,
-              max_chars=42, min_words=3, exclusions=(), allow_comparison=False,
-              reference_keywords=()):
-    if not records:
-        raise ValueError("Enter at least one basis and keyword.")
-    if len(records) > 5000:
-        raise ValueError("Review up to 5,000 keywords per run.")
-    groups = {}
-    for index, row in enumerate(records):
-        basis, original = kw_text(row.get("basis")), kw_text(row.get("keyword"))
-        if not basis or not original:
-            raise ValueError("Every review row needs a basis and an original keyword.")
-        if len(original) > 300:
-            raise ValueError("Original keywords must be at most 300 characters for review.")
-        language = kw_text(row.get("language", "EN")).upper() or "EN"
-        key = (kw_normalize(basis), language)
-        groups.setdefault(key, []).append((index, basis, original, language, kw_topic(basis, row.get("topic", ""))))
-    output = [None] * len(records)
-    internal = {"flagged": 0, "suggested": 0, "unresolved": 0, "flagged_indices": []}
-    for group in groups.values():
-        if len(group) > 250:
-            raise ValueError("Review up to 250 keywords per basis and language per run.")
-        retained, flagged = [], []
-        for entry in group:
-            index, basis, original, language, topic = entry
-            valid = kw_is_valid(original, max_chars, min_words, exclusions, allow_comparison, language)
-            related = kw_relevant(original, basis, topic)
-            conflict = any(kw_pair_conflict(original, other, lev_threshold, overlap_threshold) for other in retained)
-            if valid and related and not conflict:
-                retained.append(original)
-                output[index] = [basis, original, ""]
-            else:
-                flagged.append(entry)
-        for index, basis, original, language, topic in flagged:
-            internal["flagged"] += 1
-            internal["flagged_indices"].append(index)
-            replacement = ""
-            for candidate, _ in kw_candidates(model_json, basis, original, language, topic, reference_keywords):
-                if not kw_is_valid(candidate, max_chars, min_words, exclusions, allow_comparison, language):
-                    continue
-                if not kw_relevant(candidate, basis, topic):
-                    continue
-                if any(kw_pair_conflict(candidate, other, lev_threshold, overlap_threshold) for other in retained):
-                    continue
-                replacement = candidate
-                retained.append(candidate)
-                break
-            output[index] = [basis, original, replacement]
-            internal["suggested" if replacement else "unresolved"] += 1
-    return pd.DataFrame(output, columns=KW_RESULT_COLUMNS), internal
-
-
-def kw_read_upload(uploaded, widget_prefix="kw_upload"):
-    data = uploaded.getvalue()
-    suffix = uploaded.name.rsplit(".", 1)[-1].lower()
-    if suffix in {"xlsx", "xls"}:
-        book = pd.ExcelFile(BytesIO(data))
-        sheet = st.selectbox("Worksheet", book.sheet_names, key=f"{widget_prefix}_sheet_{uploaded.file_id}")
-        return pd.read_excel(book, sheet_name=sheet, dtype=object)
-    errors = []
-    for encoding in ("utf-8-sig", "utf-16", "cp1252"):
-        try:
-            text = data.decode(encoding)
-            return pd.read_csv(BytesIO(text.encode("utf-8")), sep=None, engine="python", dtype=object)
-        except (UnicodeError, pd.errors.ParserError, pd.errors.EmptyDataError) as exc:
-            errors.append(str(exc))
-    raise ValueError("Could not read the file. Use a CSV, TSV, XLSX, or XLS workbook.")
-
-
-def kw_map_upload(frame, prefix, default_language):
-    if frame.empty or not len(frame.columns):
-        raise ValueError("The uploaded sheet is empty.")
-    columns = list(frame.columns)
-    names = [str(c) for c in columns]
-    def default_index(terms, fallback=0):
-        return next((i for i, name in enumerate(names) if kw_normalize(name) in terms), fallback)
-    basis_col = st.selectbox("Basis Column", columns,
-        index=default_index({"basis", "url basis", "pattern"}), key=prefix + "_basis")
-    keyword_cols = st.multiselect("Keyword Columns", columns,
-        default=[columns[default_index({"keyword", "keywords", "original keyword", "approved keyword"}, min(1, len(columns)-1))]],
-        key=prefix + "_keywords", help="Choose several columns for workbooks with one keyword per column.")
-    optional = [None] + columns
-    lang_col = st.selectbox("Language Column (Optional)", optional,
-        format_func=lambda x: "Use Selected Language" if x is None else str(x), key=prefix + "_lang")
-    topic_col = st.selectbox("Topic Column (Optional)", optional,
-        format_func=lambda x: "Infer From Basis" if x is None else str(x), key=prefix + "_topic",
-        help="Use a readable product or topic, for example Laptop for laptop*prime*day.")
-    if not keyword_cols or basis_col in keyword_cols:
-        raise ValueError("Select separate basis and keyword columns.")
-    records = []
-    for _, row in frame.iterrows():
-        basis = kw_text(row[basis_col])
-        if not basis:
-            continue
-        language = (kw_text(row[lang_col]) if lang_col is not None else default_language).upper() or default_language
-        topic = kw_text(row[topic_col]) if topic_col is not None else ""
-        for column in keyword_cols:
-            # Support several keywords within a newline-separated cell, without splitting commas in text.
-            for keyword in str(row[column]).splitlines() if pd.notna(row[column]) else []:
-                if kw_text(keyword):
-                    records.append({"basis": basis, "keyword": kw_text(keyword), "language": language, "topic": topic})
-    if not records:
-        raise ValueError("No complete basis–keyword pairs were found.")
-    return records
-
-
-def keyword_review_page():
-    st.header("ML Keyword Review")
-    st.write("Review keywords within each basis and suggest alternatives from approved examples.")
-    try:
-        import sklearn  # Dependency check is confined to this page.
-    except ImportError:
-        st.error("Install the keyword tool dependencies: pip install scikit-learn openpyxl xlrd")
-        return
-    kw_initialize_database()
-    username = st.session_state.get("authenticated_username", "Unknown")
-    language = st.text_input("Language Code", value="EN", key="kw_language").strip().upper()
-    if not language:
-        st.info("Enter a language code before continuing.")
-        return
-    training_tab, review_tab = st.tabs(["Training Data", "Review Keywords"])
-    with training_tab:
-        version = kw_active_version()
-        approved = kw_load_examples()
-        c1, c2 = st.columns(2)
-        c1.metric("Approved Examples", len(approved))
-        c2.metric("Training Version", version["id"] if version else "Not Trained")
-        if version:
-            st.caption(f"Trained {version['trained_at']} by {version['trained_by']} · {version['example_count']} examples.")
-        st.caption("Upload examples you already consider good. Approved examples become active after Train / Retrain.")
-        training_file = st.file_uploader("Approved Basis–Keyword Data", type=["csv", "tsv", "xlsx", "xls"], key="kw_training_file")
-        if training_file is not None:
-            try:
-                frame = kw_read_upload(training_file, "kw_training")
-                training_rows = kw_map_upload(frame, "kw_train_map", language)
-                st.dataframe(pd.DataFrame(training_rows).head(100), hide_index=True, width="stretch")
-                st.caption(f"{len(training_rows):,} pairs ready to add; preview shows the first 100.")
-                if st.button("Add Approved Examples", key="kw_add_examples"):
-                    if len(approved) + len(training_rows) > 50000:
-                        st.error("This version supports up to 50,000 approved examples.")
-                    else:
-                        added = kw_store_examples(training_rows, username)
-                        st.session_state["kw_training_notice"] = f"Added {added:,} approved examples. Train / Retrain to use them."
-                        st.rerun()
-            except (ValueError, ImportError, OSError) as exc:
-                st.error(str(exc))
-        if st.session_state.get("kw_training_notice"):
-            st.info(st.session_state.pop("kw_training_notice"))
-        if st.button("Train / Retrain", type="primary", key="kw_retrain"):
-            try:
-                with st.spinner("Training from approved examples..."):
-                    version_id = kw_train(username)
-                st.session_state.pop("kw_results", None)
-                st.session_state.pop("kw_pending_approval", None)
-                st.session_state["kw_training_notice"] = f"Training version {version_id} is ready."
-                st.rerun()
-            except (ValueError, ImportError) as exc:
-                st.error(str(exc))
-        if approved:
-            st.download_button("Download Approved Training Data", pd.DataFrame(approved).to_csv(index=False).encode("utf-8-sig"),
-                "approved_keyword_training.csv", "text/csv", key="kw_download_training")
-    with review_tab:
-        version = kw_active_version()
-        if not version:
-            st.info("Add approved examples and train to enable learned suggestions. Similarity review and reference keywords are available now.")
-        mode = st.radio("Input Method", ["Paste Keywords", "Upload Workbook"], horizontal=True, key="kw_input_mode")
-        review_rows, references = [], []
-        if mode == "Paste Keywords":
-            basis = st.text_input("Basis", placeholder="laptop*prime*day", key="kw_basis")
-            topic = st.text_input("Readable Topic (Optional)", placeholder="Laptop", key="kw_topic",
-                help="Specify the product or topic if the basis uses abbreviations, regex, or stems.")
-            raw_keywords = st.text_area("Original Keywords — One Per Line", height=180, key="kw_originals")
-            review_rows = [{"basis": basis.strip(), "keyword": line.strip(), "language": language, "topic": topic}
-                for line in raw_keywords.splitlines() if line.strip()]
-            raw_reference = st.text_area("Reference Keywords (Optional) — One Per Line", key="kw_references",
-                help="Relevant approved examples for this basis, used for this run only.")
-            references = [line.strip() for line in raw_reference.splitlines() if line.strip()]
-        else:
-            review_file = st.file_uploader("Basis And Original Keywords", type=["csv", "tsv", "xlsx", "xls"], key="kw_review_file")
-            if review_file is not None:
-                try:
-                    review_rows = kw_map_upload(kw_read_upload(review_file, "kw_review"), "kw_review_map", language)
-                    st.caption(f"{len(review_rows):,} keywords loaded for review.")
-                except (ValueError, ImportError, OSError) as exc:
-                    st.error(str(exc))
-        with st.expander("Review Settings"):
-            lev_threshold = st.slider("Levenshtein Similarity Threshold (%)", 60, 100, 80, key="kw_lev")
-            overlap_threshold = st.slider("Maximum Word Overlap (%)", 30, 100, 50, key="kw_overlap")
-            max_chars = st.number_input("Maximum Characters", 20, 100, 42, key="kw_max_chars")
-            min_words = st.number_input("Minimum Words", 1, 10, 3, key="kw_min_words")
-            allow_comparison = st.checkbox("Allow Comparison Keywords", key="kw_comparisons")
-            raw_exclusions = st.text_area("Excluded Terms — One Per Line", key="kw_exclusions")
-            st.caption("Exact duplicates and nearly identical sequences are always checked. Grammar and contextual claims need your review.")
-        exclusions = tuple(line.strip() for line in raw_exclusions.splitlines() if line.strip())
-        options = dict(lev_threshold=lev_threshold, overlap_threshold=overlap_threshold, max_chars=int(max_chars),
-            min_words=int(min_words), exclusions=exclusions, allow_comparison=allow_comparison,
-            reference_keywords=references)
-        fingerprint = hashlib.sha256(json.dumps({"rows": review_rows, "options": options,
-            "version": version["id"] if version else None}, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
-        if st.button("Review And Suggest", type="primary", key="kw_run_review"):
-            try:
-                with st.spinner("Reviewing keywords and selecting replacements..."):
-                    results, stats = kw_review(review_rows, version["examples_json"] if version else None, **options)
-                st.session_state.pop("kw_pending_approval", None)
-                st.session_state["kw_results"] = {"frame": results, "stats": stats,
-                    "fingerprint": fingerprint, "rows": review_rows}
-            except (ValueError, ImportError) as exc:
-                st.error(str(exc))
-        saved = st.session_state.get("kw_results")
-        if saved and saved["fingerprint"] != fingerprint:
-            st.session_state.pop("kw_pending_approval", None)
-            st.info("Inputs or settings changed. Run Review And Suggest again to refresh the results.")
-            return
-        if saved:
-            st.subheader("Results")
-            stats = saved["stats"]
-            st.caption(f"{stats['flagged']} need review · {stats['suggested']} replacements suggested · {stats['unresolved']} unresolved.")
-            st.caption("A blank replacement means either the original was retained or no suitable alternative was found. Review contextual fit before approving.")
-            # Exactly the three user-requested columns, including editable replacement text.
-            edited = st.data_editor(saved["frame"], hide_index=True, width="stretch",
-                disabled=["Basis", "Original Keyword"], num_rows="fixed",
-                key="kw_editor_" + fingerprint, column_order=KW_RESULT_COLUMNS)
-            st.download_button("Download Results", edited[KW_RESULT_COLUMNS].to_csv(index=False).encode("utf-8-sig"),
-                "keyword_review_results.csv", "text/csv", key="kw_download_results")
-            approval_signature = hashlib.sha256(
-                (fingerprint + edited[KW_RESULT_COLUMNS].to_json(orient="records", force_ascii=False)).encode()
-            ).hexdigest()
-            pending = st.session_state.get("kw_pending_approval")
-            if pending and pending["signature"] != approval_signature:
-                st.session_state.pop("kw_pending_approval", None)
-            if st.session_state.get("kw_approval_notice"):
-                st.success(st.session_state.pop("kw_approval_notice"))
-            if st.button("Approve And Save Replacements", key="kw_approve"):
-                accepted, issues = [], []
-                final_by_group = {}
-                for index, row in edited.iterrows():
-                    source = saved["rows"][index]
-                    replacement = kw_text(row["Suggested Replacement"])
-                    final = replacement or source["keyword"]
-                    group_key = (kw_normalize(source["basis"]), source["language"].upper())
-                    # Unresolved flagged originals are excluded from the approved final set.
-                    if replacement or index not in saved["stats"]["flagged_indices"]:
-                        final_by_group.setdefault(group_key, []).append((index, final, bool(replacement)))
-                    if replacement:
-                        reasons = kw_validation_reasons(
-                            replacement, source["basis"], kw_topic(source["basis"], source.get("topic", "")),
-                            int(max_chars), int(min_words), exclusions, allow_comparison, source["language"],
-                        )
-                        for reason in reasons:
-                            issues.append(f'Row {index + 1} — "{replacement}": {reason}')
-                        accepted.append({**source, "keyword": replacement})
-                for group in final_by_group.values():
-                    for i, (index, final, changed) in enumerate(group):
-                        for other_index, other, other_changed in group[:i]:
-                            if changed or other_changed:
-                                reasons = kw_pair_reasons(other, final, lev_threshold, overlap_threshold)
-                                for reason in reasons:
-                                    issues.append(f'Rows {other_index + 1} and {index + 1} — "{other}" / "{final}": {reason}')
-                st.session_state.pop("kw_pending_approval", None)
-                if not accepted:
-                    st.info("There are no replacements to save.")
-                elif issues:
-                    st.session_state["kw_pending_approval"] = {
-                        "signature": approval_signature, "records": accepted, "issues": issues,
-                    }
-                else:
-                    added = kw_store_examples(accepted, username)
-                    st.success(f"Saved {added} approved examples. Train / Retrain to include them in future suggestions.")
-            pending = st.session_state.get("kw_pending_approval")
-            if pending and pending["signature"] == approval_signature:
-                st.info("The checks flagged these replacements:\n\n" +
-                    "\n".join("- " + issue for issue in pending["issues"]))
-                st.write("Do you still want to approve and save these replacements?")
-                approve_col, cancel_col = st.columns(2)
-                with approve_col:
-                    if st.button("Approve Anyway", type="primary", key="kw_approve_anyway"):
-                        added = kw_store_examples(pending["records"], username)
-                        st.session_state.pop("kw_pending_approval", None)
-                        st.session_state["kw_approval_notice"] = (
-                            f"Saved {added} approved examples with your override. "
-                            "Train / Retrain to include them in future suggestions."
-                        )
-                        st.rerun()
-                with cancel_col:
-                    if st.button("Cancel Approval", key="kw_cancel_approval"):
-                        st.session_state.pop("kw_pending_approval", None)
-                        st.rerun()
-
-
-# =============================================================
 # APPLICATION ACCESS GATE AND TOP NAVIGATION
 # =============================================================
 if not st.session_state.get("admin_authenticated", False):
@@ -2111,7 +1697,6 @@ navigation = st.navigation(
         st.Page(global_pattern_dashboard_page, title="Global Pattern Dashboard", icon=":material/dashboard:"),
         st.Page(coverage_report_page, title="Coverage Report", icon=":material/analytics:"),
         st.Page(concatenate_sheet_page, title="Concatenate Sheet", icon=":material/link:"),
-        st.Page(keyword_review_page, title="Keyword Review", icon=":material/edit_note:"),
     ],
     position="top",
 )
