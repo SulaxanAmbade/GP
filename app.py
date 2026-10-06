@@ -1082,18 +1082,6 @@ def clear_coverage_reports():
 # COVERAGE REPORT UI
 # =============================================================
 def render_coverage_report(final_df):
-    st.subheader("URL Coverage Report")
-    st.write(
-        "Check URLs against bases from the active global pattern dataset. "
-        "Matching is global and does not compare domains. A basis matches when "
-        "all its *-separated parts appear anywhere in the URL path, in any order. "
-        "Words within each part remain adjacent. Plural URL words "
-        "can match singular bases, but singular URL words cannot match plural bases. "
-        "Use * to separate required parts: "
-        "prime*day*dewalt matches dewalt-tool-deals-prime-day. "
-        "Wrap a word in ~ to lock it: sharp*~eye~ matches sharp-eye, "
-        "but not sharp-eyes. Backslashes in bases are ignored."
-    )
     if final_df.empty:
         st.warning("Upload a shared global pattern dataset before creating a coverage report.")
         return
