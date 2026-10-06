@@ -944,16 +944,18 @@ def create_coverage_report(input_df, basis_catalog):
             ))
             continue
         matched_bases = []
+        matched_languages = set()
         for basis_id in ids:
             _, basis, language, source_domain, pattern_id, priority = records[basis_id]
             matched_bases.append(str(basis))
+            matched_languages.add(str(language))
             detail_rows.append((
                 url, domain, language, "Covered", basis, source_domain,
                 pattern_id, priority, impressions, revenue,
             ))
         matched_bases = list(dict.fromkeys(matched_bases))
         summary_rows.append((
-            url, domain, language_label, "Covered", len(matched_bases),
+            url, domain, ", ".join(sorted(matched_languages)), "Covered", len(matched_bases),
             " | ".join(matched_bases), impressions, revenue,
         ))
     url_summary_df = pd.DataFrame(summary_rows, columns=summary_columns)
@@ -983,39 +985,51 @@ def create_coverage_report(input_df, basis_catalog):
 
 
 def add_user_coverage_bases(basis_catalog, edited_rows, selected_languages):
-    """Combine existing bases with unique user additions for this report only."""
+    """Assign each new basis only to the language chosen on its editor row."""
     if isinstance(selected_languages, str):
         selected_languages = [selected_languages]
     selected_languages = sorted(set(selected_languages))
     if (not selected_languages or basis_catalog.empty
             or not basis_catalog["language_code"].isin(selected_languages).all()):
         raise ValueError("Use the basis catalog for the report's selected languages.")
+    if "Language Code" not in edited_rows.columns:
+        raise ValueError("The new-basis table must include a Language Code column.")
     existing = set(zip(basis_catalog["language_code"], basis_catalog["normalized_basis"]))
     added_rows = []
     invalid = []
-    for value in edited_rows["New Basis"]:
-        if pd.isna(value):
+    for row_number, (value, language_value) in enumerate(
+        edited_rows[["New Basis", "Language Code"]].itertuples(index=False, name=None), 1,
+    ):
+        if pd.isna(value) or not str(value).strip():
             continue
-        # Several bases can be entered in one cell, separated by semicolons.
+        language = "" if pd.isna(language_value) else str(language_value).strip().lower()
+        if not language:
+            invalid.append(f"Row {row_number}: choose a language code for the new basis.")
+            continue
+        if language not in selected_languages:
+            invalid.append(
+                f"Row {row_number}: language '{language}' is not selected at the top of the report."
+            )
+            continue
+        # Multiple bases in a cell all use the language on that same row.
         for raw_basis in re.split(r"[;\n]+", str(value)):
             basis = raw_basis.strip().strip("*").strip()
             if not basis:
                 continue
             normalized = normalize_coverage_basis(basis)
             if not normalized:
-                invalid.append(raw_basis.strip())
+                invalid.append(f"Row {row_number}: '{raw_basis.strip()}' contains no searchable words.")
                 continue
-            for language in selected_languages:
-                if (language, normalized) in existing:
-                    continue
-                existing.add((language, normalized))
-                added_rows.append({
-                    "domain": "User Added", "normalized_domain": "",
-                    "basis": basis, "normalized_basis": normalized,
-                    "language_code": language,
-                    "url_pattern_id": f"user-added-{len(added_rows) + 1}",
-                    "priority": "",
-                })
+            if (language, normalized) in existing:
+                continue
+            existing.add((language, normalized))
+            added_rows.append({
+                "domain": "User Added", "normalized_domain": "",
+                "basis": basis, "normalized_basis": normalized,
+                "language_code": language,
+                "url_pattern_id": f"user-added-{len(added_rows) + 1}",
+                "priority": "",
+            })
     additions = pd.DataFrame(added_rows, columns=basis_catalog.columns)
     combined = pd.concat([basis_catalog, additions], ignore_index=True)
     combined = combined.sort_values(
@@ -1119,7 +1133,8 @@ def render_coverage_report(final_df):
     st.caption(
         f"{len(basis_catalog):,} language/basis pairs are available for "
         f"{', '.join(language.upper() for language in selected_languages)}. "
-        "Each URL is counted once in URL Summary. Match Details shows each basis's language."
+        "Each URL is counted once. Covered summary rows show matching languages; "
+        "Match Details shows each basis's language."
     )
     input_type = st.radio(
         "Input type", ["Paste URLs", "Upload CSV With Performance"],
@@ -1237,19 +1252,26 @@ def render_coverage_report(final_df):
         "Separate multiple bases in one cell with semicolons. "
         "The next report checks every original URL against existing bases and "
         "all unique new bases for the selected languages. "
-        "New bases are applied to every selected language for this check."
+        "Choose a Language Code for each row; its new bases use only that language."
     )
     st.caption("New bases are used for this coverage check and do not update the shared dataset.")
-    editor_input = uncovered.assign(**{"New Basis": ""})
+    editor_input = uncovered.assign(**{
+        "New Basis": "",
+        "Language Code": selected_languages[0] if len(selected_languages) == 1 else "",
+    })
     revision = st.session_state.get("coverage_report_revision", 0)
     edited_rows = st.data_editor(
         editor_input, hide_index=True, use_container_width=True,
         num_rows="fixed", disabled=["URL"],
-        key=f"coverage_new_basis_editor_{revision}",
+        key=f"coverage_new_basis_language_editor_{revision}",
         column_config={
             "URL": st.column_config.TextColumn("No Matching Basis URL", width="large"),
             "New Basis": st.column_config.TextColumn(
                 "New Basis", width="large", help="Example: bug*bite; heart*health",
+            ),
+            "Language Code": st.column_config.SelectboxColumn(
+                "Language Code", options=[""] + list(selected_languages), width="small",
+                help="Choose one of the language codes selected at the top. Applies to this row's new bases.",
             ),
         },
     )
@@ -1257,15 +1279,15 @@ def render_coverage_report(final_df):
         basis_catalog, edited_rows, selected_languages,
     )
     if invalid:
-        st.warning("These entries contain no searchable words and were ignored: " + ", ".join(invalid))
+        st.warning("Please fix the following entries before rechecking:\n\n" + "\n".join(f"- {message}" for message in invalid))
     st.caption(
         f"{additions['normalized_basis'].nunique():,} unique new basis/bases "
         f"across {len(additions):,} language/basis pairs ready to check."
     )
-    additions_signature = additions.to_csv(index=False)
+    additions_signature = edited_rows[["URL", "New Basis", "Language Code"]].to_csv(index=False)
     if st.button(
         "Check Coverage With Existing and New Bases", type="primary",
-        use_container_width=True, disabled=additions.empty,
+        use_container_width=True, disabled=additions.empty or bool(invalid),
         key="coverage_recheck_button",
     ):
         with st.spinner("Checking coverage with existing and new bases..."):
@@ -1276,8 +1298,8 @@ def render_coverage_report(final_df):
     revised_report = st.session_state.get("coverage_recheck_report")
     if revised_report is None:
         return
-    if st.session_state.get("coverage_recheck_signature") != additions_signature:
-        st.info("New basis entries changed. Run the coverage check again to refresh the second report.")
+    if invalid or st.session_state.get("coverage_recheck_signature") != additions_signature:
+        st.info("New basis or language entries changed. Fix any flagged rows and run the coverage check again to refresh the second report.")
         return
     st.write("---")
     original_covered = int(url_summary_df["Coverage Status"].eq("Covered").sum())
