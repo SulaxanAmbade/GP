@@ -1318,21 +1318,52 @@ def render_coverage_report(final_df):
 # =============================================================
 # CONCATENATE / PATTERN GENERATOR PAGE
 # =============================================================
+def clean_generator_domain(value):
+    """Convert pasted HTTP links into plain domains without changing bases."""
+    if pd.isna(value):
+        return ""
+    value = str(value).strip()
+    markdown_link = re.fullmatch(r"\[[^\]]*\]\((https?://[^\s)]+)\)", value, re.IGNORECASE)
+    if markdown_link:
+        value = markdown_link.group(1)
+    value = value.strip("<>").strip()
+    if re.match(r"^(?:https?:)?//", value, flags=re.IGNORECASE):
+        parsed = urlsplit(value)
+        return (parsed.hostname or "").strip()
+    return value
+
+
 def concatenate_sheet_page():
     st.header("Concatenate Sheet")
     st.write("Enter Domain and Basis values in the table below. Each row will generate one pattern.")
-    default_df = pd.DataFrame({"Domain": [""], "Basis": [""]})
+    if "pattern_generator_data" not in st.session_state:
+        st.session_state["pattern_generator_data"] = pd.DataFrame({"Domain": [""], "Basis": [""]})
+    default_df = st.session_state["pattern_generator_data"]
+    revision = st.session_state.get("pattern_generator_revision", 0)
     input_df = st.data_editor(
-        default_df, num_rows="dynamic", use_container_width=True, key="pattern_generator_table",
+        default_df, num_rows="dynamic", use_container_width=True,
+        key=f"pattern_generator_plain_domain_table_{revision}",
         column_config={
-            "Domain": st.column_config.TextColumn("Domain", help="Example: example.com", width="large"),
+            "Domain": st.column_config.TextColumn(
+                "Domain", help="Plain domain, for example example.com. Pasted HTTP links are cleaned automatically.",
+                width="large",
+            ),
             "Basis": st.column_config.TextColumn("Basis", help="Example: labor day", width="large"),
         },
     )
+    cleaned_domains = input_df["Domain"].map(clean_generator_domain)
+    original_domains = input_df["Domain"].fillna("").astype(str)
+    if not cleaned_domains.equals(original_domains):
+        refreshed = input_df.copy()
+        refreshed["Domain"] = cleaned_domains
+        st.session_state["pattern_generator_data"] = refreshed.reset_index(drop=True)
+        st.session_state["pattern_generator_revision"] = revision + 1
+        st.rerun()
     if st.button("Generate Patterns", type="primary", use_container_width=True):
         df = input_df.copy()
         for column in ("Domain", "Basis"):
             df[column] = df[column].fillna("").astype(str).str.strip()
+        df["Domain"] = df["Domain"].map(clean_generator_domain)
         df = df.loc[df["Domain"].ne("") & df["Basis"].ne("")].copy()
         if df.empty:
             st.warning("Please enter at least one Domain and Basis.")
@@ -1344,7 +1375,13 @@ def concatenate_sheet_page():
                 return f"*{domain}*{basis}*"
             df["Pattern"] = df.apply(generate_pattern, axis=1)
             st.success(f"Generated {len(df):,} pattern(s).")
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            st.dataframe(
+                df, use_container_width=True, hide_index=True,
+                column_config={
+                    "Domain": st.column_config.TextColumn("Domain"),
+                    "Pattern": st.column_config.TextColumn("Pattern"),
+                },
+            )
             st.download_button(
                 "Download Patterns As TXT", data="\n".join(df["Pattern"].tolist()),
                 file_name="generated_patterns.txt", mime="text/plain", use_container_width=True,
