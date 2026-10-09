@@ -1,2 +1,4 @@
 /.streamlit/secrets.toml
 /url_patterns.db
+*.joblib
+keyword_mapper_models/
