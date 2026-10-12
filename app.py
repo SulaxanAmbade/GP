@@ -3001,29 +3001,34 @@ def keyword_mapper_page():
         st.caption("Semantic labeling and supplementary generation are enabled. Relevant pairs are sent to the configured model; labels are cached and batches are bounded. Generated suggestions are not added to training data.")
     else:
         st.caption("Local automatic labeling is active. Broader semantic labeling and new supplementary concepts require server secrets GLOBAL_PATTERN_SEMANTIC_ENABLED = true and OPENAI_API_KEY. Without this connection, uncertain pairs are excluded and generation stays within locally supported concepts.")
-    metric = st.selectbox("Performance Metric", ["kwdl2r","kwdrpm","revenue","rpc"], key="simple_mapper_metric")
-    uploaded = st.file_uploader("Performing Keywords CSV", type=["csv"], key="simple_mapper_csv")
-    performance_input, metric_column = None, None
-    if uploaded is not None:
-        try:
-            performance_input = mapper_read_csv(uploaded)
-            detected = mapper_metric_columns(performance_input, metric)
-            options = detected + [column for column in performance_input.columns if column not in detected]
-            csv_signature = hashlib.sha256(uploaded.getvalue()).hexdigest()[:12]
-            metric_column = st.selectbox(
-                "Select Metric Column", options, index=0 if detected else None,
-                placeholder="Choose the column containing your selected metric",
-                key=f"mapper_metric_column_{metric}_{csv_signature}",
-                help="Detected header variations appear first. You can also select another column manually.",
-            )
-            if len(detected) > 1:
-                st.caption("Multiple matching metric columns detected. Select the one you want to rank by.")
-            elif not detected:
-                st.caption("No standard metric header detected. Select the correct CSV column manually.")
-        except ValueError as exc:
-            st.error(str(exc))
-    language = st.text_input("CSV Language (if neither KBB Selected Language nor language is present)", value="en", key="simple_mapper_language")
-    st.caption("CSV columns: Keyword Term and your selected metric (Revenue, KWD RPM (audited), KWDL2R or RPC). Language: KBB Selected Language, or language. Blank/null language values become Not categorized and are eligible for every requested language. An empty CSV with these headers is allowed when you only want model suggestions.")
+    source_mode = st.radio("Keyword Source",["Use Performance CSV","Shared Model Only"],horizontal=True,key="simple_mapper_source")
+    use_performance_csv = source_mode == "Use Performance CSV"
+    uploaded,performance_input,metric_column,metric,language = None,None,None,None,"en"
+    if use_performance_csv:
+        metric = st.selectbox("Performance Metric", ["kwdl2r","kwdrpm","revenue","rpc"], key="simple_mapper_metric")
+        uploaded = st.file_uploader("Performing Keywords CSV", type=["csv"], key="simple_mapper_csv")
+        if uploaded is not None:
+            try:
+                performance_input = mapper_read_csv(uploaded)
+                detected = mapper_metric_columns(performance_input, metric)
+                options = detected + [column for column in performance_input.columns if column not in detected]
+                csv_signature = hashlib.sha256(uploaded.getvalue()).hexdigest()[:12]
+                metric_column = st.selectbox(
+                    "Select Metric Column", options, index=0 if detected else None,
+                    placeholder="Choose the column containing your selected metric",
+                    key=f"mapper_metric_column_{metric}_{csv_signature}",
+                    help="Detected header variations appear first. You can also select another column manually.",
+                )
+                if len(detected) > 1:
+                    st.caption("Multiple matching metric columns detected. Select the one you want to rank by.")
+                elif not detected:
+                    st.caption("No standard metric header detected. Select the correct CSV column manually.")
+            except ValueError as exc:
+                st.error(str(exc))
+        language = st.text_input("CSV Language (if neither KBB Selected Language nor language is present)", value="en", key="simple_mapper_language")
+        st.caption("CSV columns: Keyword Term and your selected metric (Revenue, KWD RPM (audited), KWDL2R or RPC). Language: KBB Selected Language, or language. Blank/null language values become Not categorized and are eligible for every requested language. An empty CSV with these headers is allowed when you only want model suggestions.")
+    else:
+        st.info("Generate from the trained shared-data model using your basis inputs. No performance CSV or metric is required. Output keywords are flagged MODEL GENERATION.")
     method = st.radio("Basis Input", ["Manual Table","Upload CSV"], horizontal=True, key="simple_mapper_basis_method")
     if method == "Manual Table":
         basis_file = None
@@ -3040,19 +3045,22 @@ def keyword_mapper_page():
     with st.expander("Mapping Settings"):
         threshold = st.slider("Minimum Learned Relevance",0.0,1.0,.35,.01,key="simple_mapper_threshold")
         st.caption("Every CSV match, hint match and model suggestion must pass topic checks. Automatically validated supporting concepts apply only to the same basis and language. Uncertain or unrelated training pairs are excluded. Higher values are stricter. Relevance scores are not confidence probabilities. The model learns associations present in your workbook; unseen relationships may be missed.")
-        st.write("Relevant CSV keywords rank by the selected metric, highest first. Hints are used only when no relevant CSV keywords match. Any remaining slots use MODEL GENERATION suggestions; if no suitable suggestion exists, the slot stays blank.")
+        st.write("Use Performance CSV ranks relevant CSV keywords by the selected metric and fills remaining slots with model suggestions. Hints help find CSV matches. Shared Model Only generates all slots from the trained model; it uses the language on each basis row. If no suitable suggestion exists, the slot stays blank.")
         st.write("New priorities: broad single-term basis = 10000; more specific multi-term basis = 8000; domain containing promote = 1000. An exact domain/basis/language already in the database retains its saved priority.")
         st.caption("Model suggestions can reuse learned phrases or combine learned wording. Review them before use. CSV status columns preserve the flags; colors appear in the preview.")
-    if st.button("Map Keywords",type="primary",use_container_width=True,key="simple_mapper_run"):
+    if st.button("Map Keywords" if use_performance_csv else "Generate Keywords",type="primary",use_container_width=True,key="simple_mapper_run"):
         st.session_state.pop("simple_mapper_result",None)
         st.session_state.pop("mapper_semantic_notice",None)
-        if uploaded is None or (method=="Upload CSV" and basis_file is None):
-            st.warning("Upload the performing CSV and provide the basis inputs.")
+        if (use_performance_csv and uploaded is None) or (method=="Upload CSV" and basis_file is None):
+            st.warning("Upload the performing CSV and provide the basis inputs." if use_performance_csv else "Provide the basis inputs or upload the Basis CSV.")
         else:
             try:
-                if performance_input is None or metric_column is None:
-                    raise ValueError("Choose a valid metric column from the performing CSV.")
-                keywords = mapper_prepare_keywords(performance_input,metric,language,metric_column)
+                if use_performance_csv:
+                    if performance_input is None or metric_column is None:
+                        raise ValueError("Choose a valid metric column from the performing CSV.")
+                    keywords = mapper_prepare_keywords(performance_input,metric,language,metric_column)
+                else:
+                    keywords = mapper_prepare_keywords(pd.DataFrame(columns=["Keyword Term","Revenue","language"]),"revenue","en")
                 bases = mapper_prepare_bases(mapper_read_csv(basis_file) if basis_file else bases_input)
                 with st.spinner("Learning from shared data and mapping keywords..."):
                     model, message = mapper_ensure_auto_model()
@@ -3061,11 +3069,15 @@ def keyword_mapper_page():
                     st.session_state["simple_mapper_labeling_pending"] = model.get("labeling_pending",0)
                     st.session_state["simple_mapper_labeling_notes"] = model.get("labeling_notes",[])
                 st.session_state["simple_mapper_result"] = result
+                st.session_state["simple_mapper_source_mode"] = source_mode
                 st.session_state["simple_mapper_message"] = message
                 st.session_state["simple_mapper_model_ready"] = model is not None
             except ValueError as exc:
                 st.error(str(exc))
     if "simple_mapper_result" not in st.session_state:
+        return
+    if st.session_state.get("simple_mapper_source_mode","Use Performance CSV") != source_mode:
+        st.info("Keyword source changed. Run mapping or generation again to refresh the results.")
         return
     result = st.session_state["simple_mapper_result"]
     if not st.session_state.get("simple_mapper_model_ready"):
@@ -3082,7 +3094,7 @@ def keyword_mapper_page():
     st.success(f"CSV mapped: {mapped:,} | MODEL GENERATION: {generated:,} | Unfilled: {blank:,}")
     if generated:
         st.info("Purple MODEL GENERATION rows are suggestions from the learned workbook model. Review them before using the CSV.")
-    st.caption("These are results from your last run. Click Map Keywords after changing inputs.")
+    st.caption("These are results from your last run. Run mapping or generation again after changing inputs.")
     st.dataframe(result.style.apply(mapper_highlight,axis=1),hide_index=True,use_container_width=True)
     st.download_button("Download Mapped Keywords CSV",result.to_csv(index=False).encode("utf-8-sig"),
         "mapped_keywords.csv","text/csv",use_container_width=True,key="simple_mapper_download")

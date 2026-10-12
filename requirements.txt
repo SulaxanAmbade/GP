@@ -2,3 +2,4 @@ streamlit
 pandas
 xlrd
 lxml
+scikit-learn
