@@ -1029,7 +1029,7 @@ def create_coverage_report(input_df, basis_catalog, selected_languages=None):
 
 
 def add_user_coverage_bases(basis_catalog, edited_rows, selected_languages):
-    """Assign each new basis only to the language chosen on its editor row."""
+    """Assign new bases their row's language and optional numeric priority."""
     if isinstance(selected_languages, str):
         selected_languages = [selected_languages]
     selected_languages = sorted(set(selected_languages))
@@ -1039,10 +1039,14 @@ def add_user_coverage_bases(basis_catalog, edited_rows, selected_languages):
     if "Language Code" not in edited_rows.columns:
         raise ValueError("The new-basis table must include a Language Code column.")
     existing = set(zip(basis_catalog["language_code"], basis_catalog["normalized_basis"]))
+    edited_rows = edited_rows.copy()
+    if "Priority" not in edited_rows.columns:
+        edited_rows["Priority"] = None
     added_rows = []
+    added_positions = {}
     invalid = []
-    for row_number, (value, language_value) in enumerate(
-        edited_rows[["New Basis", "Language Code"]].itertuples(index=False, name=None), 1,
+    for row_number, (value, language_value, priority_value) in enumerate(
+        edited_rows[["New Basis", "Language Code", "Priority"]].itertuples(index=False, name=None), 1,
     ):
         if pd.isna(value) or not str(value).strip():
             continue
@@ -1055,7 +1059,14 @@ def add_user_coverage_bases(basis_catalog, edited_rows, selected_languages):
                 f"Row {row_number}: language '{language}' is not selected at the top of the report."
             )
             continue
-        # Multiple bases in a cell all use the language on that same row.
+        priority = ""
+        if pd.notna(priority_value) and str(priority_value).strip():
+            numeric_priority = coverage_priority_value(priority_value)
+            if not numeric_priority.is_finite() or numeric_priority != numeric_priority.to_integral_value():
+                invalid.append(f"Row {row_number}: priority must be a nonnegative whole number, or left blank.")
+                continue
+            priority = str(int(numeric_priority))
+        # Multiple bases in a cell all use the language and priority of that row.
         for raw_basis in re.split(r"[;\n]+", str(value)):
             basis = raw_basis.strip().strip("*").strip()
             if not basis:
@@ -1066,13 +1077,19 @@ def add_user_coverage_bases(basis_catalog, edited_rows, selected_languages):
                 continue
             if (language, normalized) in existing:
                 continue
-            existing.add((language, normalized))
+            identity = (language, normalized)
+            if identity in added_positions:
+                previous = added_rows[added_positions[identity]]
+                if coverage_priority_value(priority) < coverage_priority_value(previous["priority"]):
+                    previous["priority"] = priority
+                continue
+            added_positions[identity] = len(added_rows)
             added_rows.append({
                 "domain": "User Added", "normalized_domain": "",
                 "basis": basis, "normalized_basis": normalized,
                 "language_code": language,
                 "url_pattern_id": f"user-added-{len(added_rows) + 1}",
-                "priority": "",
+                "priority": priority,
             })
     additions = pd.DataFrame(added_rows, columns=basis_catalog.columns)
     combined = pd.concat([basis_catalog, additions], ignore_index=True)
@@ -1328,11 +1345,12 @@ def render_coverage_report(final_df):
         st.success("All submitted URLs have a matching basis. You can still exclude caught bases and run a second check.")
     else:
         st.subheader("Add Bases for URLs With No Matching Basis")
-        st.write("Enter a new basis beside each URL, for example bug*bite. Separate multiple bases with semicolons. Choose the Language Code for each row. The second report checks all original URLs against remaining existing bases and these new bases.")
+        st.write("Enter a new basis beside each URL, for example bug*bite. Separate multiple bases with semicolons. Choose its Language Code and Priority. The second report checks all original URLs against remaining existing bases and new bases using the same priority order: 1000 before 2000. Blank priorities catch last. Multiple bases in one row share its priority.")
         st.caption("New bases are used for this coverage check and do not update the shared dataset.")
     editor_input = uncovered.assign(**{
         "New Basis": "",
         "Language Code": selected_languages[0] if len(selected_languages) == 1 else "",
+        "Priority": pd.Series(pd.NA,index=uncovered.index,dtype="Int64"),
     })
     if editor_input.empty:
         edited_rows = editor_input
@@ -1340,10 +1358,11 @@ def render_coverage_report(final_df):
         edited_rows = st.data_editor(
             editor_input, hide_index=True, use_container_width=True,
             num_rows="fixed", disabled=["URL"],
-            key=f"coverage_new_basis_language_editor_{revision}",
+            key=f"coverage_new_basis_priority_editor_{revision}",
             column_config={
                 "URL": st.column_config.TextColumn("No Matching Basis URL", width="large"),
                 "New Basis": st.column_config.TextColumn("New Basis",width="large",help="Example: bug*bite; heart*health"),
+                "Priority": st.column_config.NumberColumn("Priority",min_value=0,step=1,help="Optional. Lower numbers catch first, e.g. 1000 before 2000. Blank catches last."),
                 "Language Code": st.column_config.SelectboxColumn(
                     "Language Code",options=[""]+list(selected_languages),width="small",
                     help="Choose one of the language codes selected at the top.",
@@ -1361,7 +1380,7 @@ def render_coverage_report(final_df):
     )
     remaining_catalog, excluded_keys = coverage_exclude_bases(combined_catalog,excluded_choices)
     st.caption(f"{len(excluded_keys):,} caught basis/language pair(s) excluded from the second check.")
-    additions_signature = (edited_rows[["URL", "New Basis", "Language Code"]].to_csv(index=False)
+    additions_signature = (edited_rows[["URL", "New Basis", "Language Code", "Priority"]].to_csv(index=False)
                            + json.dumps(excluded_keys,ensure_ascii=False))
     if st.button(
         "Run Second Coverage Check", type="primary",
@@ -1377,7 +1396,7 @@ def render_coverage_report(final_df):
     if revised_report is None:
         return
     if invalid or st.session_state.get("coverage_recheck_signature") != additions_signature:
-        st.info("Exclusions, new bases or language entries changed. Run Second Coverage Check again to refresh the report.")
+        st.info("Exclusions, new bases, priorities or language entries changed. Run Second Coverage Check again to refresh the report.")
         return
     st.write("---")
     original_covered = int(url_summary_df["Coverage Status"].eq("Covered").sum())
@@ -1387,7 +1406,7 @@ def render_coverage_report(final_df):
         revised_report, "Priority URL Summary — Second Coverage Check", "coverage_rechecked",
     )
     st.download_button(
-        "Download New Bases", data=additions[["basis", "language_code"]].to_csv(index=False),
+        "Download New Bases", data=additions[["basis", "language_code", "priority"]].to_csv(index=False),
         file_name="coverage_new_bases.csv", mime="text/csv", use_container_width=True,
         key="coverage_download_new_bases",
     )
