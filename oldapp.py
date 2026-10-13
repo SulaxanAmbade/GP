@@ -1029,7 +1029,7 @@ def create_coverage_report(input_df, basis_catalog, selected_languages=None):
 
 
 def add_user_coverage_bases(basis_catalog, edited_rows, selected_languages):
-    """Assign each new basis only to the language chosen on its editor row."""
+    """Assign new bases their row's language and optional numeric priority."""
     if isinstance(selected_languages, str):
         selected_languages = [selected_languages]
     selected_languages = sorted(set(selected_languages))
@@ -1039,10 +1039,14 @@ def add_user_coverage_bases(basis_catalog, edited_rows, selected_languages):
     if "Language Code" not in edited_rows.columns:
         raise ValueError("The new-basis table must include a Language Code column.")
     existing = set(zip(basis_catalog["language_code"], basis_catalog["normalized_basis"]))
+    edited_rows = edited_rows.copy()
+    if "Priority" not in edited_rows.columns:
+        edited_rows["Priority"] = None
     added_rows = []
+    added_positions = {}
     invalid = []
-    for row_number, (value, language_value) in enumerate(
-        edited_rows[["New Basis", "Language Code"]].itertuples(index=False, name=None), 1,
+    for row_number, (value, language_value, priority_value) in enumerate(
+        edited_rows[["New Basis", "Language Code", "Priority"]].itertuples(index=False, name=None), 1,
     ):
         if pd.isna(value) or not str(value).strip():
             continue
@@ -1055,7 +1059,14 @@ def add_user_coverage_bases(basis_catalog, edited_rows, selected_languages):
                 f"Row {row_number}: language '{language}' is not selected at the top of the report."
             )
             continue
-        # Multiple bases in a cell all use the language on that same row.
+        priority = ""
+        if pd.notna(priority_value) and str(priority_value).strip():
+            numeric_priority = coverage_priority_value(priority_value)
+            if not numeric_priority.is_finite() or numeric_priority != numeric_priority.to_integral_value():
+                invalid.append(f"Row {row_number}: priority must be a nonnegative whole number, or left blank.")
+                continue
+            priority = str(int(numeric_priority))
+        # Multiple bases in a cell all use the language and priority of that row.
         for raw_basis in re.split(r"[;\n]+", str(value)):
             basis = raw_basis.strip().strip("*").strip()
             if not basis:
@@ -1066,13 +1077,19 @@ def add_user_coverage_bases(basis_catalog, edited_rows, selected_languages):
                 continue
             if (language, normalized) in existing:
                 continue
-            existing.add((language, normalized))
+            identity = (language, normalized)
+            if identity in added_positions:
+                previous = added_rows[added_positions[identity]]
+                if coverage_priority_value(priority) < coverage_priority_value(previous["priority"]):
+                    previous["priority"] = priority
+                continue
+            added_positions[identity] = len(added_rows)
             added_rows.append({
                 "domain": "User Added", "normalized_domain": "",
                 "basis": basis, "normalized_basis": normalized,
                 "language_code": language,
                 "url_pattern_id": f"user-added-{len(added_rows) + 1}",
-                "priority": "",
+                "priority": priority,
             })
     additions = pd.DataFrame(added_rows, columns=basis_catalog.columns)
     combined = pd.concat([basis_catalog, additions], ignore_index=True)
@@ -1328,11 +1345,12 @@ def render_coverage_report(final_df):
         st.success("All submitted URLs have a matching basis. You can still exclude caught bases and run a second check.")
     else:
         st.subheader("Add Bases for URLs With No Matching Basis")
-        st.write("Enter a new basis beside each URL, for example bug*bite. Separate multiple bases with semicolons. Choose the Language Code for each row. The second report checks all original URLs against remaining existing bases and these new bases.")
+        st.write("Enter a new basis beside each URL, for example bug*bite. Separate multiple bases with semicolons. Choose its Language Code and Priority. The second report checks all original URLs against remaining existing bases and new bases using the same priority order: 1000 before 2000. Blank priorities catch last. Multiple bases in one row share its priority.")
         st.caption("New bases are used for this coverage check and do not update the shared dataset.")
     editor_input = uncovered.assign(**{
         "New Basis": "",
         "Language Code": selected_languages[0] if len(selected_languages) == 1 else "",
+        "Priority": pd.Series(pd.NA,index=uncovered.index,dtype="Int64"),
     })
     if editor_input.empty:
         edited_rows = editor_input
@@ -1340,10 +1358,11 @@ def render_coverage_report(final_df):
         edited_rows = st.data_editor(
             editor_input, hide_index=True, use_container_width=True,
             num_rows="fixed", disabled=["URL"],
-            key=f"coverage_new_basis_language_editor_{revision}",
+            key=f"coverage_new_basis_priority_editor_{revision}",
             column_config={
                 "URL": st.column_config.TextColumn("No Matching Basis URL", width="large"),
                 "New Basis": st.column_config.TextColumn("New Basis",width="large",help="Example: bug*bite; heart*health"),
+                "Priority": st.column_config.NumberColumn("Priority",min_value=0,step=1,help="Optional. Lower numbers catch first, e.g. 1000 before 2000. Blank catches last."),
                 "Language Code": st.column_config.SelectboxColumn(
                     "Language Code",options=[""]+list(selected_languages),width="small",
                     help="Choose one of the language codes selected at the top.",
@@ -1361,7 +1380,7 @@ def render_coverage_report(final_df):
     )
     remaining_catalog, excluded_keys = coverage_exclude_bases(combined_catalog,excluded_choices)
     st.caption(f"{len(excluded_keys):,} caught basis/language pair(s) excluded from the second check.")
-    additions_signature = (edited_rows[["URL", "New Basis", "Language Code"]].to_csv(index=False)
+    additions_signature = (edited_rows[["URL", "New Basis", "Language Code", "Priority"]].to_csv(index=False)
                            + json.dumps(excluded_keys,ensure_ascii=False))
     if st.button(
         "Run Second Coverage Check", type="primary",
@@ -1377,7 +1396,7 @@ def render_coverage_report(final_df):
     if revised_report is None:
         return
     if invalid or st.session_state.get("coverage_recheck_signature") != additions_signature:
-        st.info("Exclusions, new bases or language entries changed. Run Second Coverage Check again to refresh the report.")
+        st.info("Exclusions, new bases, priorities or language entries changed. Run Second Coverage Check again to refresh the report.")
         return
     st.write("---")
     original_covered = int(url_summary_df["Coverage Status"].eq("Covered").sum())
@@ -1387,7 +1406,7 @@ def render_coverage_report(final_df):
         revised_report, "Priority URL Summary — Second Coverage Check", "coverage_rechecked",
     )
     st.download_button(
-        "Download New Bases", data=additions[["basis", "language_code"]].to_csv(index=False),
+        "Download New Bases", data=additions[["basis", "language_code", "priority"]].to_csv(index=False),
         file_name="coverage_new_bases.csv", mime="text/csv", use_container_width=True,
         key="coverage_download_new_bases",
     )
@@ -2982,29 +3001,34 @@ def keyword_mapper_page():
         st.caption("Semantic labeling and supplementary generation are enabled. Relevant pairs are sent to the configured model; labels are cached and batches are bounded. Generated suggestions are not added to training data.")
     else:
         st.caption("Local automatic labeling is active. Broader semantic labeling and new supplementary concepts require server secrets GLOBAL_PATTERN_SEMANTIC_ENABLED = true and OPENAI_API_KEY. Without this connection, uncertain pairs are excluded and generation stays within locally supported concepts.")
-    metric = st.selectbox("Performance Metric", ["kwdl2r","kwdrpm","revenue","rpc"], key="simple_mapper_metric")
-    uploaded = st.file_uploader("Performing Keywords CSV", type=["csv"], key="simple_mapper_csv")
-    performance_input, metric_column = None, None
-    if uploaded is not None:
-        try:
-            performance_input = mapper_read_csv(uploaded)
-            detected = mapper_metric_columns(performance_input, metric)
-            options = detected + [column for column in performance_input.columns if column not in detected]
-            csv_signature = hashlib.sha256(uploaded.getvalue()).hexdigest()[:12]
-            metric_column = st.selectbox(
-                "Select Metric Column", options, index=0 if detected else None,
-                placeholder="Choose the column containing your selected metric",
-                key=f"mapper_metric_column_{metric}_{csv_signature}",
-                help="Detected header variations appear first. You can also select another column manually.",
-            )
-            if len(detected) > 1:
-                st.caption("Multiple matching metric columns detected. Select the one you want to rank by.")
-            elif not detected:
-                st.caption("No standard metric header detected. Select the correct CSV column manually.")
-        except ValueError as exc:
-            st.error(str(exc))
-    language = st.text_input("CSV Language (if neither KBB Selected Language nor language is present)", value="en", key="simple_mapper_language")
-    st.caption("CSV columns: Keyword Term and your selected metric (Revenue, KWD RPM (audited), KWDL2R or RPC). Language: KBB Selected Language, or language. Blank/null language values become Not categorized and are eligible for every requested language. An empty CSV with these headers is allowed when you only want model suggestions.")
+    source_mode = st.radio("Keyword Source",["Use Performance CSV","Shared Model Only"],horizontal=True,key="simple_mapper_source")
+    use_performance_csv = source_mode == "Use Performance CSV"
+    uploaded,performance_input,metric_column,metric,language = None,None,None,None,"en"
+    if use_performance_csv:
+        metric = st.selectbox("Performance Metric", ["kwdl2r","kwdrpm","revenue","rpc"], key="simple_mapper_metric")
+        uploaded = st.file_uploader("Performing Keywords CSV", type=["csv"], key="simple_mapper_csv")
+        if uploaded is not None:
+            try:
+                performance_input = mapper_read_csv(uploaded)
+                detected = mapper_metric_columns(performance_input, metric)
+                options = detected + [column for column in performance_input.columns if column not in detected]
+                csv_signature = hashlib.sha256(uploaded.getvalue()).hexdigest()[:12]
+                metric_column = st.selectbox(
+                    "Select Metric Column", options, index=0 if detected else None,
+                    placeholder="Choose the column containing your selected metric",
+                    key=f"mapper_metric_column_{metric}_{csv_signature}",
+                    help="Detected header variations appear first. You can also select another column manually.",
+                )
+                if len(detected) > 1:
+                    st.caption("Multiple matching metric columns detected. Select the one you want to rank by.")
+                elif not detected:
+                    st.caption("No standard metric header detected. Select the correct CSV column manually.")
+            except ValueError as exc:
+                st.error(str(exc))
+        language = st.text_input("CSV Language (if neither KBB Selected Language nor language is present)", value="en", key="simple_mapper_language")
+        st.caption("CSV columns: Keyword Term and your selected metric (Revenue, KWD RPM (audited), KWDL2R or RPC). Language: KBB Selected Language, or language. Blank/null language values become Not categorized and are eligible for every requested language. An empty CSV with these headers is allowed when you only want model suggestions.")
+    else:
+        st.info("Generate from the trained shared-data model using your basis inputs. No performance CSV or metric is required. Output keywords are flagged MODEL GENERATION.")
     method = st.radio("Basis Input", ["Manual Table","Upload CSV"], horizontal=True, key="simple_mapper_basis_method")
     if method == "Manual Table":
         basis_file = None
@@ -3021,19 +3045,22 @@ def keyword_mapper_page():
     with st.expander("Mapping Settings"):
         threshold = st.slider("Minimum Learned Relevance",0.0,1.0,.35,.01,key="simple_mapper_threshold")
         st.caption("Every CSV match, hint match and model suggestion must pass topic checks. Automatically validated supporting concepts apply only to the same basis and language. Uncertain or unrelated training pairs are excluded. Higher values are stricter. Relevance scores are not confidence probabilities. The model learns associations present in your workbook; unseen relationships may be missed.")
-        st.write("Relevant CSV keywords rank by the selected metric, highest first. Hints are used only when no relevant CSV keywords match. Any remaining slots use MODEL GENERATION suggestions; if no suitable suggestion exists, the slot stays blank.")
+        st.write("Use Performance CSV ranks relevant CSV keywords by the selected metric and fills remaining slots with model suggestions. Hints help find CSV matches. Shared Model Only generates all slots from the trained model; it uses the language on each basis row. If no suitable suggestion exists, the slot stays blank.")
         st.write("New priorities: broad single-term basis = 10000; more specific multi-term basis = 8000; domain containing promote = 1000. An exact domain/basis/language already in the database retains its saved priority.")
         st.caption("Model suggestions can reuse learned phrases or combine learned wording. Review them before use. CSV status columns preserve the flags; colors appear in the preview.")
-    if st.button("Map Keywords",type="primary",use_container_width=True,key="simple_mapper_run"):
+    if st.button("Map Keywords" if use_performance_csv else "Generate Keywords",type="primary",use_container_width=True,key="simple_mapper_run"):
         st.session_state.pop("simple_mapper_result",None)
         st.session_state.pop("mapper_semantic_notice",None)
-        if uploaded is None or (method=="Upload CSV" and basis_file is None):
-            st.warning("Upload the performing CSV and provide the basis inputs.")
+        if (use_performance_csv and uploaded is None) or (method=="Upload CSV" and basis_file is None):
+            st.warning("Upload the performing CSV and provide the basis inputs." if use_performance_csv else "Provide the basis inputs or upload the Basis CSV.")
         else:
             try:
-                if performance_input is None or metric_column is None:
-                    raise ValueError("Choose a valid metric column from the performing CSV.")
-                keywords = mapper_prepare_keywords(performance_input,metric,language,metric_column)
+                if use_performance_csv:
+                    if performance_input is None or metric_column is None:
+                        raise ValueError("Choose a valid metric column from the performing CSV.")
+                    keywords = mapper_prepare_keywords(performance_input,metric,language,metric_column)
+                else:
+                    keywords = mapper_prepare_keywords(pd.DataFrame(columns=["Keyword Term","Revenue","language"]),"revenue","en")
                 bases = mapper_prepare_bases(mapper_read_csv(basis_file) if basis_file else bases_input)
                 with st.spinner("Learning from shared data and mapping keywords..."):
                     model, message = mapper_ensure_auto_model()
@@ -3042,11 +3069,15 @@ def keyword_mapper_page():
                     st.session_state["simple_mapper_labeling_pending"] = model.get("labeling_pending",0)
                     st.session_state["simple_mapper_labeling_notes"] = model.get("labeling_notes",[])
                 st.session_state["simple_mapper_result"] = result
+                st.session_state["simple_mapper_source_mode"] = source_mode
                 st.session_state["simple_mapper_message"] = message
                 st.session_state["simple_mapper_model_ready"] = model is not None
             except ValueError as exc:
                 st.error(str(exc))
     if "simple_mapper_result" not in st.session_state:
+        return
+    if st.session_state.get("simple_mapper_source_mode","Use Performance CSV") != source_mode:
+        st.info("Keyword source changed. Run mapping or generation again to refresh the results.")
         return
     result = st.session_state["simple_mapper_result"]
     if not st.session_state.get("simple_mapper_model_ready"):
@@ -3063,7 +3094,7 @@ def keyword_mapper_page():
     st.success(f"CSV mapped: {mapped:,} | MODEL GENERATION: {generated:,} | Unfilled: {blank:,}")
     if generated:
         st.info("Purple MODEL GENERATION rows are suggestions from the learned workbook model. Review them before using the CSV.")
-    st.caption("These are results from your last run. Click Map Keywords after changing inputs.")
+    st.caption("These are results from your last run. Run mapping or generation again after changing inputs.")
     st.dataframe(result.style.apply(mapper_highlight,axis=1),hide_index=True,use_container_width=True)
     st.download_button("Download Mapped Keywords CSV",result.to_csv(index=False).encode("utf-8-sig"),
         "mapped_keywords.csv","text/csv",use_container_width=True,key="simple_mapper_download")
@@ -3103,7 +3134,7 @@ def audit_count_values(series, name):
     return counts
 
 
-def remove_pair_report_total_rows(frame, basis_column, keyword_column):
+def remove_pair_report_total_rows(frame, basis_column=None, keyword_column=None):
     from html import unescape
     def report_label(value):
         text = unescape(mapper_text(value)).casefold()
@@ -3113,166 +3144,355 @@ def remove_pair_report_total_rows(frame, basis_column, keyword_column):
         return re.sub(r"url\s*\(", "url (", text)
     excluded = {"grand total", "report total", "stripped url (others)",
                 "report total stripped url (others)", "grand total stripped url (others)"}
-    checked = [basis_column, keyword_column]
-    checked.extend(column for column in frame.columns if mapper_header(column) == "url")
+    # Upload cleanup also recognizes summary labels in otherwise unnamed report columns.
+    checked = [column for column in (basis_column, keyword_column) if column in frame.columns]
+    checked.extend(frame.columns)
     mask = pd.Series(False,index=frame.index)
     for column in dict.fromkeys(checked):
         mask |= frame[column].map(report_label).isin(excluded)
-    return frame.loc[~mask].copy(), int(mask.sum())
+    cleaned = frame.loc[~mask].copy()
+    count = int(mask.sum())
+    cleaned.attrs["excluded_report_rows"] = frame.attrs.get("excluded_report_rows", 0) + count
+    return cleaned, count
 
 
-def prepare_pair_performance_csv(frame):
-    audited_columns = [col for col in frame.columns if mapper_header(col) == mapper_header("KWD RPM (audited)")]
-    rpm_columns = audited_columns or mapper_metric_columns(frame,"kwdrpm")
-    if len(rpm_columns) != 1:
-        raise ValueError("Provide one KWD RPM (audited) column for the performance check.")
-    columns = {
-        "basis": mapper_find_column(frame,["Basis Name","basis"]),
-        "keyword": mapper_find_column(frame,["Keyword Term","keyword"]),
-        "impressions": mapper_find_column(frame,["Keyword Impressions"]),
-        "clicks": mapper_find_column(frame,["Keyword Clicks","KWD Clicks"]),
-        "rpm": rpm_columns[0],
-    }
-    frame, excluded_rows = remove_pair_report_total_rows(frame,columns["basis"],columns["keyword"])
-    # Keep only the input fields used by this check; other report columns
-    # cannot enter pair aggregation or the output CSV.
-    result = pd.DataFrame({name: frame[col].map(mapper_text) for name,col in columns.items()})
-    result = result.loc[~result.eq("").all(axis=1)].copy().reset_index(drop=True)
-    if result["basis"].eq("").any() or result["keyword"].eq("").any():
-        raise ValueError("Every performance row needs Basis Name and Keyword Term.")
-    result["impressions"] = audit_count_values(result["impressions"],"Keyword Impressions")
-    result["clicks"] = audit_count_values(result["clicks"],"Keyword Clicks")
-    cleaned_rpm = result["rpm"].str.replace(",","",regex=False).str.replace(r"[$€£\s]","",regex=True)
-    result["rpm"] = pd.to_numeric(cleaned_rpm,errors="coerce")
-    invalid_rpm = result["rpm"].isna() | result["rpm"].isin([float("inf"),float("-inf")]) | result["rpm"].lt(0)
-    if invalid_rpm.any():
-        raise ValueError("KWD RPM (audited) must contain finite, nonnegative numeric values for every performance row.")
-    result["basis_key"] = result["basis"].map(audit_pattern_key)
-    result["keyword_key"] = result["keyword"].map(audit_text_key)
-    result.attrs["excluded_report_rows"] = excluded_rows
-    return result
+PERFORMANCE_ALIASES = {
+    "basis": ["basis", "basis name", "url pattern"],
+    "keyword": ["kwds", "kwd", "keyword", "keywords", "keyword term"],
+    "impressions": ["kimpressions", "keyword impressions", "kwd impressions", "impressions"],
+    "revenue": ["revenue", "keyword revenue", "kwd revenue", "earnings"],
+    "rpm": ["krpm", "rpm", "kwdrpm", "keyword rpm", "KWD RPM (audited)"],
+    "l2r": ["kl2r", "l2r", "kwdl2r", "keyword l2r"],
+    "rpc": ["rpc", "keyword rpc", "kwd rpc"],
+    "clicks": ["kwd clicks", "keyword clicks", "kclicks"],
+    "ad_clicks": ["ad clicks", "adclicks"],
+    "language": ["languagecode", "language code", "language", "KBB Selected Language"],
+    "domain": ["domain"],
+}
 
 
-def build_existing_pair_export(performance, patterns, keyword_rows):
-    """Exact stored mappings only. No semantic matching or keyword generation."""
-    output_columns = ["domain","basis","keyword","language"]
-    if performance.empty:
-        return pd.DataFrame(columns=output_columns), {"pairs":0,"base_qualified":0,"qualified":0,"matched":0}, []
-    performance = performance.assign(rpm_weighted=performance["rpm"] * performance["impressions"])
-    totals = performance.groupby(["basis_key","keyword_key"],as_index=False,sort=False).agg(
-        impressions=("impressions","sum"), clicks=("clicks","sum"), basis=("basis","first"), keyword=("keyword","first"),
-        rpm_weighted=("rpm_weighted","sum"),
-    )
-    eligible = totals.loc[totals["impressions"].ge(1000) & totals["clicks"].ge(5)].copy()
-    # Consolidate repeated pair rates by impressions, then average distinct
-    # eligible pairs equally within each basis before checking stored mappings.
-    eligible["rpm"] = eligible["rpm_weighted"] / eligible["impressions"]
-    eligible["basis_average_rpm"] = eligible.groupby("basis_key")["rpm"].transform("mean")
-    qualifying = eligible.loc[eligible["rpm"].lt(eligible["basis_average_rpm"])]
-    # The private keyword snapshot can outlive an upload without keyword data.
-    # Only relationships whose exact source pattern/language are still live count.
-    live = {}
-    for row in patterns.to_dict("records"):
-        pattern = mapper_text(row.get("url_pattern"))
-        language = mapper_text(row.get("language_code")).lower()
-        live.setdefault((audit_pattern_key(pattern),language),[]).append(row)
-    index = {}
-    for row in keyword_rows.to_dict("records"):
-        pattern = mapper_text(row["source_pattern"])
-        language = mapper_text(row["language"]).lower()
-        source_matches = live.get((audit_pattern_key(pattern),language),[])
-        source_admin = row.get("source_admin_name")
-        if source_admin is not None and not pd.isna(source_admin):
-            source_matches = [source for source in source_matches if audit_text_key(source.get("admin_name")) == audit_text_key(source_admin)]
-        elif ".promote" in pattern.casefold() and len({audit_text_key(source.get("admin_name")) for source in source_matches}) > 1:
-            # Older snapshots did not retain row-specific admin provenance.
-            # Never attribute a keyword to an arbitrary set ID in that case.
-            source_matches = [dict(source_matches[0],admin_name="")]
-        if not source_matches:
+def performance_number(series, label):
+    text = series.map(mapper_text).str.replace(",", "", regex=False)
+    text = text.str.replace(r"[$€£%\s]", "", regex=True).str.replace(r"^\((.*)\)$", r"-\1", regex=True)
+    values = pd.to_numeric(text, errors="coerce")
+    invalid = values.isna() | values.isin([float("inf"), -float("inf")]) | values.lt(0)
+    if invalid.any():
+        raise ValueError(f"{label}: missing, negative or invalid numbers on data row(s) " +
+                         ", ".join(str(i + 1) for i in range(len(values)) if invalid.iloc[i])[:300])
+    return values
+
+
+def performance_live_index(patterns, keyword_rows):
+    """Only keyword relationships belonging to the active workbook may qualify."""
+    live, index = {}, {}
+    for source in patterns.to_dict("records"):
+        key = (audit_pattern_key(source.get("url_pattern")), mapper_text(source.get("language_code")).lower())
+        live.setdefault(key, []).append(source)
+    for record in keyword_rows.to_dict("records"):
+        pattern = mapper_text(record.get("source_pattern"))
+        language = mapper_text(record.get("language")).lower()
+        sources = live.get((audit_pattern_key(pattern), language), [])
+        admin = record.get("source_admin_name")
+        if admin is not None and not pd.isna(admin):
+            sources = [s for s in sources if audit_text_key(s.get("admin_name")) == audit_text_key(admin)]
+        elif ".promote" in pattern.casefold() and len({audit_text_key(s.get("admin_name")) for s in sources}) > 1:
+            sources = [dict(sources[0], admin_name="")]
+        if not sources:
             continue
-        domain,basis = split_domain_basis(pattern)
-        keys = {audit_pattern_key(basis),audit_pattern_key(pattern),audit_pattern_key(domain+"*"+basis)}
-        for basis_key in keys:
-            index.setdefault((basis_key,audit_text_key(row["keyword"])),[]).extend(
-                (domain,basis,row["keyword"],language,source) for source in source_matches
-            )
-    rows,issues,seen,seen_issues = [],[],set(),set()
-    matched = 0
-    for row in qualifying.to_dict("records"):
-        matches = index.get((row["basis_key"],row["keyword_key"]),[])
-        if matches:
-            matched += 1
-        for domain,basis,keyword,language,source in matches:
-            decorated,issue = export_promote_domain(domain,source.get("admin_name"))
-            if issue:
-                issue_key=(source["url_pattern"],language,issue)
-                if issue_key not in seen_issues:
-                    issues.append({"url_pattern":source["url_pattern"],"language":language,"reason":issue})
-                    seen_issues.add(issue_key)
-                continue  # Do not invent a promote set ID in the output.
-            key = (decorated,basis,audit_text_key(keyword),language)
-            if key not in seen:
-                rows.append(dict(domain=decorated,basis=basis,keyword=keyword,language=mapper_text(source.get("language_code"))))
-                seen.add(key)
-    stats = {"pairs":len(totals),"base_qualified":len(eligible),"qualified":len(qualifying),"matched":matched}
-    return pd.DataFrame(rows,columns=output_columns),stats,issues
+        domain, basis = split_domain_basis(pattern)
+        for source in sources:
+            decorated, issue = export_promote_domain(domain, source.get("admin_name"))
+            mapping = dict(domain=decorated, basis=basis, keywords=mapper_text(record.get("keyword")),
+                           languagecode=language, priority=mapper_text(source.get("priority")), issue=issue)
+            for alias in {basis, pattern, domain + "*" + basis}:
+                index.setdefault((audit_pattern_key(alias), audit_text_key(record.get("keyword"))), []).append(mapping)
+    return index
+
+
+def prepare_performance_review(frame, columns, patterns, keyword_rows):
+    for field in ("basis", "keyword", "impressions", "rpm"):
+        if not columns.get(field):
+            raise ValueError(f"Choose the {field} column.")
+    mapped = [c for c in columns.values() if c]
+    if len(mapped) != len(set(mapped)):
+        raise ValueError("Each source column can be mapped to only one field.")
+    source, removed = remove_pair_report_total_rows(frame, columns["basis"], columns["keyword"])
+    removed += frame.attrs.get("excluded_report_rows", 0)
+    source = source.loc[~source.apply(lambda row: all(not mapper_text(v) for v in row), axis=1)].reset_index(drop=True)
+    data = pd.DataFrame(index=source.index)
+    for field in ("basis", "keyword", "language", "domain"):
+        data[field] = source[columns[field]].map(mapper_text) if columns.get(field) else ""
+    if data["basis"].eq("").any() or data["keyword"].eq("").any():
+        raise ValueError("Every data row requires a basis and keyword.")
+    data["impressions"] = audit_count_values(source[columns["impressions"]], "Keyword impressions")
+    data["rpm"] = performance_number(source[columns["rpm"]], "Pair RPM")
+    data["basis_key"] = data["basis"].map(audit_pattern_key)
+    data["keyword_key"] = data["keyword"].map(audit_text_key)
+    data["language"] = data["language"].str.lower()
+    data["domain"] = data["domain"].map(mapper_domain_key)
+    data["weighted_rpm"] = data["impressions"] * data["rpm"]
+    data["source_row"] = source.index
+    keys = ["basis_key", "keyword_key", "language", "domain"]
+    totals = data.groupby(keys, as_index=False, sort=False).agg(
+        impressions=("impressions", "sum"), weighted_rpm=("weighted_rpm", "sum"),
+        source_rows=("source_row", list))
+    index = performance_live_index(patterns, keyword_rows)
+    eligible = []
+    for pair in totals.to_dict("records"):
+        matches = index.get((pair["basis_key"], pair["keyword_key"]), [])
+        matches = [m for m in matches if (not pair["language"] or m["languagecode"] == pair["language"])
+                   and (not pair["domain"] or mapper_domain_key(m["domain"]) == pair["domain"])]
+        if pair["impressions"] >= 1000 and matches:
+            pair["rpm"] = pair["weighted_rpm"] / pair["impressions"]
+            pair["matches"] = matches
+            eligible.append(pair)
+    pairs = pd.DataFrame(eligible)
+    review_rows, exports = [], {}
+    if not pairs.empty:
+        pairs["average"] = pairs.groupby(["basis_key", "language", "domain"])["rpm"].transform("mean")
+        for pair_id, pair in enumerate(pairs.loc[pairs["rpm"].lt(pairs["average"])].to_dict("records")):
+            exports[pair_id] = pair["matches"]
+            for row_id in pair["source_rows"]:
+                review_rows.append({"Select for deletion": False, **source.iloc[row_id].to_dict(),
+                                    "Review: Pair impressions": pair["impressions"],
+                                    "Review: Pair RPM": pair["rpm"], "Review: Basis average RPM": pair["average"],
+                                    "Review: Pair ID": pair_id})
+    reserved = {"Select for deletion", "Review: Pair impressions", "Review: Pair RPM", "Review: Basis average RPM", "Review: Pair ID"}
+    if reserved.intersection(source.columns):
+        raise ValueError("Rename CSV columns that conflict with reserved review column names.")
+    review = pd.DataFrame(review_rows)
+    if not review.empty:
+        review = review.sort_values(
+            [columns["basis"], columns["keyword"]],
+            key=lambda values: values.map(audit_text_key), kind="stable",
+        ).reset_index(drop=True)
+        display_columns = ["Select for deletion", columns["basis"], columns["keyword"],
+                           "Review: Basis average RPM", "Review: Pair RPM"]
+        review = review[display_columns + [c for c in review.columns if c not in display_columns]]
+    return review, exports, {"pairs": len(totals), "eligible": len(pairs), "underperforming": len(exports), "removed": removed}
+
+
+def performance_deletion_sheet(selected_ids, exports):
+    rows, issues = [], []
+    for pair_id in sorted(set(selected_ids)):
+        for mapping in exports[int(pair_id)]:
+            if mapping["issue"]:
+                issues.append({k: mapping[k] for k in ("domain", "basis", "languagecode", "issue")})
+            else:
+                rows.append({k: mapping[k] for k in ("domain", "basis", "keywords", "languagecode")})
+    return pd.DataFrame(rows, columns=["domain", "basis", "keywords", "languagecode"]).drop_duplicates().reset_index(drop=True), issues
+
+
+def performance_existing_basis_keywords(keyword_rows):
+    """Stored keywords by basis/language, independent of the target domain."""
+    lookup = {}
+    for record in keyword_rows.to_dict("records"):
+        pattern = mapper_text(record.get("source_pattern"))
+        if "*" in pattern.strip("*").replace("\\*", "*"):
+            _, basis = split_domain_basis(pattern)
+        else:
+            basis = mapper_text(record.get("basis")) or pattern.strip("*")
+        identity = (audit_pattern_key(basis), mapper_text(record.get("language")).lower())
+        keyword = audit_text_key(record.get("keyword"))
+        if identity[0] and keyword:
+            lookup.setdefault(identity, set()).add(keyword)
+    return lookup
+
+
+def performance_replacement_slots(deletion, patterns, keyword_rows, model):
+    rows = []
+    existing_keywords = performance_existing_basis_keywords(keyword_rows)
+    suggested_keywords = {}
+    priorities = mapper_priority_lookup(patterns)
+    for (domain, basis, language), group in deletion.groupby(["domain", "basis", "languagecode"], sort=False):
+        identity = (audit_pattern_key(basis), language)
+        excluded = set(existing_keywords.get(identity, set()))
+        excluded.update(suggested_keywords.get(identity, set()))
+        excluded.update(group["keywords"].map(audit_text_key))
+        suggestions = mapper_generate_suggestions(model, basis, language, len(group), excluded, .35)
+        accepted = []
+        for keyword in suggestions:
+            key = audit_text_key(keyword)
+            if key and key not in excluded:
+                accepted.append(keyword)
+                excluded.add(key)
+            if len(accepted) >= len(group):
+                break
+        suggestions = accepted
+        suggested_keywords.setdefault(identity, set()).update(map(audit_text_key, suggestions))
+        saved = priorities.get((mapper_domain_key(domain), mapper_basis_key(basis), language), set())
+        priority = mapper_default_priority(domain, basis)
+        if len(saved) == 1:
+            try:
+                value = Decimal(next(iter(saved)))
+                if value.is_finite() and value == value.to_integral_value():
+                    priority = int(value)
+            except InvalidOperation:
+                pass
+        for slot in range(len(group)):
+            keyword = suggestions[slot] if slot < len(suggestions) else ""
+            rows.append({"Select": bool(keyword), "domain": domain, "basis": basis, "keywords": keyword,
+                         "languagecode": language, "priority": priority,
+                         "Suggestion status": "MODEL GENERATION" if keyword else "Enter a replacement keyword"})
+    return pd.DataFrame(rows)
+
+
+def performance_upload_sheet(edited, deletion, allowed_domains, patterns, keyword_rows):
+    selected = edited.loc[edited["Select"].fillna(False)].copy()
+    if selected.empty:
+        raise ValueError("Select at least one keyword to generate an upload sheet.")
+    existing = performance_existing_basis_keywords(keyword_rows)
+    seen, rows = set(), []
+    for position, row in enumerate(selected.to_dict("records"), 1):
+        domain, basis, keyword, language = [mapper_text(row[k]) for k in ("domain", "basis", "keywords", "languagecode")]
+        language = language.lower()
+        if not keyword or not basis or not re.fullmatch(r"[a-z]{2,3}(?:-[a-z0-9]{2,8})*", language):
+            raise ValueError(f"Replacement row {position}: keyword, basis and valid language code are required.")
+        if domain not in allowed_domains:
+            raise ValueError(f"Replacement row {position}: choose an available domain.")
+        prefix = "patternkeywords.global."
+        if domain.startswith(prefix) and not domain.startswith(prefix + "promote.") and domain != prefix + language:
+            raise ValueError(f"Replacement row {position}: language-specific domain must match languagecode.")
+        try:
+            priority = Decimal(mapper_text(row["priority"]))
+            if not priority.is_finite() or priority != priority.to_integral_value() or priority < 0:
+                raise InvalidOperation
+        except InvalidOperation:
+            raise ValueError(f"Replacement row {position}: priority must be a nonnegative whole number.")
+        key = (audit_pattern_key(basis), language, audit_text_key(keyword))
+        if key in seen or key[2] in existing.get(key[:2], set()):
+            raise ValueError(f"Replacement row {position}: this keyword is already present under the same basis/language, or repeats another selected replacement, regardless of domain.")
+        seen.add(key)
+        rows.append(dict(domain=domain, basis=basis, keywords=keyword, languagecode=language, rank=1, priority=int(priority)))
+    return pd.DataFrame(rows)
 
 
 def underperforming_pairs_page():
-    st.header("Existing Keyword Performance Check")
-    st.write("Find existing basis–keyword mappings with at least 1,000 keyword impressions and 5 keyword clicks whose audited RPM is below their basis average.")
-    uploaded = st.file_uploader("Performance CSV Files",type=["csv"],accept_multiple_files=True,key="pair_check_files")
-    st.caption("Supported columns: Basis Name, Keyword Term, Keyword Impressions, Revenue, KWD RPM (audited), RPC, Keyword Clicks, Ad Clicks. The check uses Basis Name, Keyword Term, Keyword Impressions, Keyword Clicks and KWD RPM (audited). Extra report columns are ignored. Grand Total, Report Total and Stripped URL (Others) rows are removed before checking.")
-    st.caption("Basis Name may be the exact basis or full URL pattern. Duplicate pair rows across the uploaded files are summed before applying the thresholds. Keyword matching ignores case and repeated whitespace. Inner basis wildcards remain significant.")
-    st.caption("Duplicate pair RPM is weighted by impressions. Each basis average is the simple mean RPM of its distinct pairs with at least 1,000 impressions and 5 clicks. Only pairs strictly below that average are checked against the shared database; equal RPM is excluded.")
-    if st.button("Check Existing Pairs",type="primary",use_container_width=True,key="pair_check_run"):
-        st.session_state.pop("pair_check_result",None)
-        if not uploaded:
-            st.warning("Upload at least one performance CSV.")
-        else:
-            try:
-                with st.spinner("Reading CSV files and checking existing keyword pairs..."):
-                    frames,seen_files = [],set()
-                    excluded_rows = 0
-                    for file in uploaded:
-                        digest=hashlib.sha256(file.getvalue()).hexdigest()
-                        if digest in seen_files:
-                            continue
-                        seen_files.add(digest)
-                        try:
-                            prepared = prepare_pair_performance_csv(mapper_read_csv(file))
-                            excluded_rows += prepared.attrs.get("excluded_report_rows",0)
-                            frames.append(prepared)
-                        except ValueError as exc:
-                            raise ValueError(f"{getattr(file,'name','CSV')}: {exc}") from exc
-                    with get_connection() as conn:
-                        mapper_initialize_global_keyword_store(conn)
-                        keyword_rows=pd.read_sql_query("SELECT source_pattern,keyword,language,source_admin_name FROM internal_pattern_keyword_training",conn)
-                        patterns=pd.read_sql_query("SELECT url_pattern,language_code,admin_name FROM url_patterns",conn)
-                    if keyword_rows.empty:
-                        raise ValueError("No stored pattern_keywords mappings are available. Re-upload and confirm the global workbook containing pattern_keywords first.")
-                    result,stats,issues=build_existing_pair_export(pd.concat(frames,ignore_index=True),patterns,keyword_rows)
-                    stats["excluded_rows"] = excluded_rows
-                    st.session_state["pair_check_result"] = result
-                    st.session_state["pair_check_stats"] = stats
-                    st.session_state["pair_check_issues"] = issues
-            except ValueError as exc:
-                st.error(str(exc))
-    if "pair_check_result" not in st.session_state:
+    st.header("Keyword Performance Check")
+    st.write("Select existing underperforming pairs, generate a deletion sheet, then review replacement keywords and generate an upload sheet.")
+    st.caption("Minimum: 1,000 impressions per pair; no click minimum. Duplicate pair RPM is weighted by impressions. Basis average is the simple mean RPM of existing pairs meeting the minimum, within the CSV language/domain when supplied. Equal RPM is excluded. Without those columns, every exact stored mapping is shown in the deletion preview.")
+    file = st.file_uploader("Performance CSV", type=["csv"], key="performance_workflow_file")
+    if file is None:
         return
-    result=st.session_state["pair_check_result"]
-    stats=st.session_state["pair_check_stats"]
-    st.success(f"Distinct CSV pairs: {stats['pairs']:,} | Minimums met: {stats.get('base_qualified',0):,} | Below basis average RPM: {stats['qualified']:,} | Existing qualified pairs: {stats['matched']:,} | Export rows: {len(result):,}")
-    if stats.get("excluded_rows",0):
-        st.caption(f"Removed {stats['excluded_rows']:,} report summary row(s): Grand Total, Report Total, or Stripped URL (Others).")
-    issues=st.session_state.get("pair_check_issues",[])
-    if issues:
-        st.warning(f"{len(issues):,} promote pattern(s) could not be exported because admin_name has a missing or conflicting setid.")
-        st.dataframe(pd.DataFrame(issues),hide_index=True,use_container_width=True)
-    st.caption("Results reflect the last check. Click Check Existing Pairs again after changing files or the shared dataset.")
-    st.dataframe(result,hide_index=True,use_container_width=True)
-    st.download_button("Download Existing Below-Average RPM Pairs CSV",result.to_csv(index=False).encode("utf-8-sig"),
-                       "existing_below_average_rpm_pairs.csv","text/csv",use_container_width=True,key="pair_check_download")
+    try:
+        frame, removed_on_upload = remove_pair_report_total_rows(mapper_read_csv(file))
+        if removed_on_upload:
+            st.info(f"Removed {removed_on_upload:,} summary row(s): Grand Total, Report Total or Stripped URL (Others).")
+        if frame.empty:
+            st.warning("The uploaded CSV contains no performance data after removing summary rows.")
+            return
+        digest = hashlib.sha256(file.getvalue()).hexdigest()[:16]
+        columns = {}
+        with st.expander("CSV column mapping", expanded=True):
+            st.caption("Basis, keyword, impressions and RPM are required. Other columns are preserved exactly in the review table.")
+            for field, aliases in PERFORMANCE_ALIASES.items():
+                detected = [c for c in frame.columns if mapper_header(c) in {mapper_header(a) for a in aliases}]
+                options = [None] + list(frame.columns)
+                columns[field] = st.selectbox(field, options, index=options.index(detected[0]) if len(detected) == 1 else 0,
+                    format_func=lambda value: "Not mapped" if value is None else value,
+                    key=f"perf_map_{digest}_{field}")
+        with get_connection() as conn:
+            mapper_initialize_global_keyword_store(conn)
+            patterns = pd.read_sql_query("SELECT url_pattern, language_code, admin_name, priority FROM url_patterns", conn)
+            keyword_rows = pd.read_sql_query("SELECT source_pattern, keyword, language, source_admin_name FROM internal_pattern_keyword_training", conn)
+        signature = hashlib.sha256((digest + json.dumps(columns, sort_keys=True) + patterns.to_json() + keyword_rows.to_json()).encode()).hexdigest()
+        if st.button("Check Keyword Performance", type="primary", key="perf_check"):
+            if keyword_rows.empty:
+                raise ValueError("Upload and confirm a shared workbook containing pattern_keywords first.")
+            review, exports, stats = prepare_performance_review(frame, columns, patterns, keyword_rows)
+            st.session_state["perf_workflow"] = dict(signature=signature, review=review, exports=exports, stats=stats,
+                                                    revision=st.session_state.get("perf_revision", 0) + 1)
+            st.session_state["perf_revision"] = st.session_state["perf_workflow"]["revision"]
+        state = st.session_state.get("perf_workflow")
+        if not state or state["signature"] != signature:
+            st.info("Run the check for the current CSV, column mapping and shared dataset.")
+            return
+        revision = state["revision"]
+        stats = state["stats"]
+        st.success(f"Pairs: {stats['pairs']:,} | Existing pairs with ≥1,000 impressions: {stats['eligible']:,} | Below basis average: {stats['underperforming']:,}")
+        if stats["removed"]:
+            st.caption(f"Removed {stats['removed']:,} report total rows.")
+        if state["review"].empty:
+            return
+        st.caption("Select any source row to select its entire aggregated pair. All original CSV columns are retained.")
+        reviewed = st.data_editor(state["review"], hide_index=True, use_container_width=True,
+            disabled=[c for c in state["review"].columns if c != "Select for deletion"],
+            column_config={"Review: Pair ID": None,
+                           "Review: Basis average RPM": st.column_config.NumberColumn("Basis Average RPM", format="%.4f"),
+                           "Review: Pair RPM": st.column_config.NumberColumn("Pair RPM", format="%.4f")},
+            key=f"perf_review_{revision}")
+        selected_ids = sorted(set(reviewed.loc[reviewed["Select for deletion"], "Review: Pair ID"].tolist()))
+        if st.button("Generate Deletion Sheet", type="primary", disabled=not selected_ids, key="perf_delete"):
+            deletion, issues = performance_deletion_sheet(selected_ids, state["exports"])
+            state.update(deletion=deletion, issues=issues, selected_ids=selected_ids)
+            for key in ("suggestions", "upload", "replacement_latest", "editor_baseline", "editor_sig"):
+                state.pop(key, None)
+            state["replacement_revision"] = state.get("replacement_revision", 0) + 1
+        if "deletion" not in state or state["selected_ids"] != selected_ids:
+            return
+        if state["issues"]:
+            st.error("Some selected mappings have an unresolved promote set ID. Correct the shared data before generating a complete deletion sheet.")
+            st.dataframe(pd.DataFrame(state["issues"]), hide_index=True)
+            return
+        deletion = state["deletion"]
+        st.subheader("Deletion Sheet")
+        st.dataframe(deletion, hide_index=True, use_container_width=True)
+        st.download_button("Download Deletion Sheet", deletion.to_csv(index=False).encode("utf-8-sig"), "keyword_deletion.csv", "text/csv")
+        st.caption(f"{len(deletion):,} keyword mappings selected for deletion. The mapper prepares {len(deletion):,} suggestion slots; you may upload any number of selected keywords. Sheets do not modify the shared database.")
+        if "suggestions" not in state:
+            with st.spinner("Preparing replacement suggestions using the keyword mapper..."):
+                try:
+                    model, message = mapper_ensure_auto_model()
+                    state["suggestions"] = performance_replacement_slots(deletion, patterns, keyword_rows, model)
+                    state["model_message"] = message if model is None else ""
+                except Exception as exc:
+                    state["suggestions"] = performance_replacement_slots(deletion, patterns, keyword_rows, None)
+                    state["model_message"] = f"Automatic suggestions unavailable: {exc}. Enter replacements in the table."
+        if state.get("model_message"):
+            st.warning(state["model_message"])
+        st.subheader("Replacement Keywords")
+        missing = int(state["suggestions"]["keywords"].eq("").sum())
+        if missing:
+            st.warning(f"The mapper supplied {len(deletion)-missing:,} of {len(deletion):,} suggestions. Fill the {missing:,} remaining slots if you want to use them, or export only your selected keywords.")
+        language_input = st.text_input("Additional language codes (comma separated)", key="perf_add_languages")
+        set_id = st.text_input("Promote set ID (required to offer a promote domain)", key="perf_set_id").strip()
+        partner = st.selectbox("Partner ID", ["8PRVCXX19", "7PRFT79UO"], key="perf_partner")
+        languages = sorted(set(deletion["languagecode"]) | {v.strip().lower() for v in language_input.split(",") if v.strip()})
+        languages = [v for v in languages if re.fullmatch(r"[a-z]{2,3}(?:-[a-z0-9]{2,8})*", v)]
+        domains = ["patternkeywords.global"] + [f"patternkeywords.global.{v}" for v in languages] + [f"{partner}.partner"]
+        if set_id:
+            if re.fullmatch(r"[0-9]+", set_id):
+                domains.append(f"patternkeywords.global.promote.{set_id}.setid")
+            else:
+                st.warning("Set ID must contain digits only.")
+        editor_sig = hashlib.sha256(json.dumps(domains).encode()).hexdigest()[:12]
+        if state.get("editor_sig") != editor_sig:
+            suggestions = state.get("replacement_latest", state["suggestions"]).copy()
+            suggestions.loc[~suggestions["domain"].isin(domains), "domain"] = "patternkeywords.global"
+            state["editor_baseline"] = suggestions
+            state["editor_sig"] = editor_sig
+        suggestions = state["editor_baseline"]
+        edited = st.data_editor(suggestions, hide_index=True, use_container_width=True, num_rows="dynamic",
+            disabled=["Suggestion status"],
+            column_config={"Select": st.column_config.CheckboxColumn("Select"),
+                           "domain": st.column_config.SelectboxColumn("domain", options=domains, required=True),
+                           "languagecode": st.column_config.SelectboxColumn("languagecode", options=languages, required=True),
+                           "priority": st.column_config.NumberColumn("priority", min_value=0, step=1, required=True)},
+            key=f"perf_replacements_{revision}_{state['replacement_revision']}_{editor_sig}")
+        # Preserve edits across domain-option changes without reusing a changed editor baseline.
+        state["replacement_latest"] = edited.copy()
+        st.caption("Select any number of keywords; add or remove rows as needed. Choose a domain and priority for each replacement. Language-specific domains must match languagecode. Promote domains use the set ID entered above.")
+        upload_signature = hashlib.sha256((edited.to_json() + json.dumps(domains)).encode()).hexdigest()
+        if st.button("Generate Upload Sheet", type="primary", key="perf_upload"):
+            state.pop("upload", None)
+            state["upload"] = performance_upload_sheet(edited, deletion, domains, patterns, keyword_rows)
+            state["upload_signature"] = upload_signature
+        if state.get("upload_signature") == upload_signature and "upload" in state:
+            st.subheader("Upload Sheet")
+            st.dataframe(state["upload"], hide_index=True, use_container_width=True)
+            st.download_button("Download Upload Sheet", state["upload"].to_csv(index=False).encode("utf-8-sig"), "keyword_upload.csv", "text/csv")
+    except (ValueError, KeyError, pd.errors.ParserError) as exc:
+        st.error(str(exc))
 
 
 # =============================================================
