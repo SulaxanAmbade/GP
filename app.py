@@ -2565,18 +2565,21 @@ def mapper_keywords_too_close(left, right):
     return (len(a)==len(b) and sum(x!=y for x,y in zip(a,b)) <= 1) or SequenceMatcher(None,a,b).ratio() > .85
 
 
-def mapper_llm_suggestions(model, basis, language, count, excluded):
-    if model is None or count <= 0 or not mapper_semantic_enabled():
+def mapper_llm_suggestions_once(model, basis, language, count, excluded):
+    if count <= 0:
         return []
-    _,context = mapper_topic_context(model,basis,language)
+    if not mapper_semantic_enabled():
+        st.session_state["mapper_semantic_notice"] = (
+            "New keyword generation is disabled: configure a nonempty OPENAI_API_KEY and "
+            "GLOBAL_PATTERN_SEMANTIC_ENABLED=true. Database suggestions can still be shown.")
+        return []
+    context = mapper_topic_context(model, basis, language)[1] if model is not None else []
     examples,concepts = [],[]
     for topic_id,relevance in context:
         topic = model["topics"][topic_id]
         examples.extend(topic["keywords"][:12])
         concepts.extend(topic.get("concepts",[])[:12])
-    # No learned context -> no ungrounded remote generation.
-    if not examples:
-        return []
+    # The supplied basis is sufficient context when no local training model is ready.
     schema = {"type":"object","properties":{"keywords":{"type":"array","items":{"type":"string"}}},
               "required":["keywords"],"additionalProperties":False}
     try:
@@ -2596,20 +2599,47 @@ def mapper_llm_suggestions(model, basis, language, count, excluded):
             if not isinstance(value,str):
                 continue
             keyword = value.strip()
-            if keyword.casefold() not in excluded and mapper_valid_generated_keyword(keyword):
+            if audit_text_key(keyword) not in {audit_text_key(term) for term in excluded} and mapper_valid_generated_keyword(keyword):
                 if not any(mapper_keywords_too_close(keyword,item) for item in candidates):
                     candidates.append(keyword)
         if not candidates:
+            st.session_state["mapper_semantic_notice"] = (
+                f"{basis}: the API returned no new keywords passing the length, wording and duplicate checks.")
             return []
-        # Every remote suggestion gets the same separate relationship checks.
-        rows = [dict(basis=basis,keyword=keyword,language=language,source="generated") for keyword in candidates[:40]]
-        labels = mapper_llm_label_pairs(rows)
-        suggestions = []
+        # Obvious direct matches use grounded local evidence; supporting concepts
+        # still receive the API relationship review. Do not discard direct keywords
+        # merely because a separate classifier assigned a score below 0.9.
+        requirements = mapper_requirements(basis)
+        direct, remaining = [], []
+        for keyword in candidates[:40]:
+            words = mapper_words(keyword)
+            literal = bool(requirements) and all(
+                any(mapper_token_match(term, word, locked) for word in words)
+                for term, locked in requirements)
+            if literal and mapper_topic_evidence(basis, keyword, language):
+                direct.append(keyword)
+            else:
+                remaining.append(keyword)
+        suggestions = direct[:count]
+        if len(suggestions) >= count:
+            return suggestions
+        rows = [dict(basis=basis,keyword=keyword,language=language,source="generated") for keyword in remaining]
+        if not rows:
+            return suggestions
+        try:
+            labels = mapper_llm_label_pairs(rows)
+        except ValueError as exc:
+            st.session_state["mapper_semantic_notice"] = str(exc)
+            return suggestions
         for row,label in zip(rows,labels):
             if label["validated"]:
                 suggestions.append(row["keyword"])
             if len(suggestions) >= count:
                 break
+        if len(suggestions) < count:
+            st.session_state["mapper_semantic_notice"] = (
+                f"{basis}: accepted {len(suggestions)} of {len(candidates)} new API candidates; "
+                "remaining candidates did not pass the topic checks. Database fallbacks may fill the shortfall.")
         return suggestions  # Never feed generated suggestions into training tables.
     except ValueError as exc:
         # Show a concise service failure without leaking keys or provider payloads.
@@ -2618,6 +2648,24 @@ def mapper_llm_suggestions(model, basis, language, count, excluded):
         except Exception:
             pass
         return []
+
+
+def mapper_llm_suggestions(model, basis, language, count, excluded):
+    """Retry shortfalls with accepted terms excluded; never copy database terms."""
+    accepted = []
+    excluded = {audit_text_key(term) for term in excluded}
+    for attempt in range(2):
+        if len(accepted) >= count:
+            break
+        batch = mapper_llm_suggestions_once(model, basis, language, count - len(accepted), excluded)
+        for keyword in batch:
+            identity = audit_text_key(keyword)
+            if identity not in excluded and not any(mapper_keywords_too_close(keyword, other) for other in accepted):
+                accepted.append(keyword)
+                excluded.add(identity)
+        if not batch and (not mapper_semantic_enabled() or st.session_state.get("mapper_semantic_notice", "").startswith("Semantic service")):
+            break
+    return accepted[:count]
 
 
 def mapper_fit_shared_model(rows):
@@ -2861,11 +2909,25 @@ def mapper_relationship_scores(model, basis, language, texts):
 
 def mapper_generate_suggestions(model, basis, language, count, excluded, threshold):
     import random
-    if model is None or count <= 0:
+    if count <= 0:
         return []
+    # Request genuinely new keywords first; saved phrases cannot exhaust every slot.
+    with get_connection() as conn:
+        mapper_initialize_global_keyword_store(conn)
+        stored = pd.read_sql_query("SELECT keyword, language FROM internal_pattern_keyword_training", conn)
+    stored_terms = {audit_text_key(row["keyword"]) for row in stored.to_dict("records")
+                    if mapper_text(row["language"]).lower() == language.lower()}
+    novel_excluded = {audit_text_key(term) for term in excluded} | stored_terms
+    generated = mapper_llm_suggestions(model, basis, language, count, novel_excluded)
+    generated = list(dict.fromkeys(keyword for keyword in generated
+                    if audit_text_key(keyword) not in novel_excluded))[:count]
+    if len(generated) >= count:
+        return generated
+    if model is None:
+        return generated
     _, context = mapper_topic_context(model, basis, language)
     if not context:
-        return []
+        return generated
     seed = int(hashlib.sha256((basis + language).encode()).hexdigest()[:16], 16)
     rng = random.Random(seed)
     candidates = {}
@@ -2898,21 +2960,16 @@ def mapper_generate_suggestions(model, basis, language, count, excluded, thresho
               and all(term in mapper_words(keyword) for term in locks)
               and mapper_model_topic_evidence(model,basis,keyword,language)]
     scores = mapper_relationship_scores(model, basis, language, usable)
-    ranked = sorted(zip(usable, scores), key=lambda pair: (-pair[1], pair[0].casefold()))
-    suggestions = []
+    # New locally composed phrases precede stored fallback phrases.
+    ranked = sorted(zip(usable, scores), key=lambda pair: (
+        audit_text_key(pair[0]) in stored_terms, -pair[1], pair[0].casefold()))
+    suggestions = list(generated)
     for keyword, score in ranked:
         if score < threshold:
             continue
         if any(mapper_keywords_too_close(keyword,other) for other in suggestions):
             continue
         suggestions.append(keyword)
-        if len(suggestions) >= count:
-            break
-    remote_excluded = set(excluded) | {keyword.casefold() for keyword in suggestions}
-    remote = mapper_llm_suggestions(model,basis,language,count-len(suggestions),remote_excluded)
-    for keyword in remote:
-        if not any(mapper_keywords_too_close(keyword,other) for other in suggestions):
-            suggestions.append(keyword)
         if len(suggestions) >= count:
             break
     return suggestions
@@ -2985,7 +3042,8 @@ def mapper_generate(keywords, bases, database, model=None, threshold=.35):
             output.append({"domain":domain,"basis":basis,"keyword":keyword,"language":language,
                            "rank":1,"priority":priority,
                            "database status":"already present" if existing is not None else "",
-                           "mapping status":status,
+                           "mapping status": (mapper_keyword_source(keyword, language, stored_keywords)
+                                              if status == "MODEL GENERATION" else status),
                            "Keyword Source": mapper_keyword_source(keyword, language, stored_keywords)
                                if status == "MODEL GENERATION" else ("Performance CSV" if keyword else "")})
     return pd.DataFrame(output, columns=MAPPER_OUTPUT_COLUMNS)
@@ -2995,7 +3053,7 @@ def mapper_highlight(row):
     styles = [""]*len(row)
     if row["database status"] == "already present":
         styles[row.index.get_loc("database status")] = "background-color: #dbeafe; color: #1e3a8a"
-    if row["mapping status"] == "MODEL GENERATION":
+    if row["mapping status"] in {"MODEL GENERATION", "System Generated"}:
         for column in ("keyword", "mapping status"):
             styles[row.index.get_loc(column)] = "background-color: #ede9fe; color: #5b21b6; font-weight: bold"
     elif row["mapping status"] == "system couldnt map":
@@ -3106,12 +3164,13 @@ def keyword_mapper_page():
         st.warning(note)
     if st.session_state.get("mapper_semantic_notice"):
         st.warning(st.session_state["mapper_semantic_notice"])
-    mapped = int((result["keyword"].ne("") & result["mapping status"].ne("MODEL GENERATION")).sum())
-    generated = int(result["mapping status"].eq("MODEL GENERATION").sum())
+    mapped = int((result["keyword"].ne("") & result["Keyword Source"].eq("Performance CSV")).sum())
+    generated = int(result["Keyword Source"].eq("System Generated").sum())
+    from_database = int(result["Keyword Source"].eq("From Database").sum())
     blank = int(result["keyword"].eq("").sum())
-    st.success(f"CSV mapped: {mapped:,} | MODEL GENERATION: {generated:,} | Unfilled: {blank:,}")
+    st.success(f"CSV mapped: {mapped:,} | From Database: {from_database:,} | System Generated: {generated:,} | Unfilled: {blank:,}")
     if generated:
-        st.info("Purple MODEL GENERATION rows are suggestions from the learned workbook model. Review them before using the CSV.")
+        st.info("System Generated rows are new keyword suggestions. From Database rows reuse stored keywords. Review both before using the CSV.")
     st.caption("Keyword Source: From Database means the suggested keyword exists in the shared keyword store for this language; System Generated means it is new. Performance CSV identifies directly mapped CSV terms.")
     st.caption("These are results from your last run. Run mapping or generation again after changing inputs.")
     st.dataframe(result.style.apply(mapper_highlight,axis=1),hide_index=True,use_container_width=True)
@@ -3471,6 +3530,10 @@ def underperforming_pairs_page():
                     state["model_message"] = f"Automatic suggestions unavailable: {exc}. Enter replacements in the table."
         if state.get("model_message"):
             st.warning(state["model_message"])
+        if not mapper_semantic_enabled():
+            st.info("API keyword generation is disabled. Set OPENAI_API_KEY and GLOBAL_PATTERN_SEMANTIC_ENABLED=true to generate new keywords with the API. Local suggestions use the shared model when available.")
+        if st.session_state.get("mapper_semantic_notice"):
+            st.warning(st.session_state["mapper_semantic_notice"])
         st.subheader("Replacement Keywords")
         missing = int(state["suggestions"]["keywords"].eq("").sum())
         if missing:
