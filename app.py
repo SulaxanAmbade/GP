@@ -1855,7 +1855,7 @@ def global_pattern_dashboard_page():
 # KEYWORD PERFORMANCE MAPPER
 # =============================================================
 MAPPER_BASIS_COLUMNS = ["domain", "basis", "no. of keywords", "language", "keyword contains hint"]
-MAPPER_OUTPUT_COLUMNS = ["domain", "basis", "keyword", "language", "rank", "priority", "database status", "mapping status"]
+MAPPER_OUTPUT_COLUMNS = ["domain", "basis", "keyword", "language", "rank", "priority", "database status", "mapping status", "Keyword Source"]
 
 
 def mapper_text(value):
@@ -2918,8 +2918,24 @@ def mapper_generate_suggestions(model, basis, language, count, excluded, thresho
     return suggestions
 
 
+def mapper_keyword_source(keyword, language, stored_keywords):
+    if not mapper_text(keyword):
+        return ""
+    identity = (mapper_text(language).lower(), audit_text_key(keyword))
+    return "From Database" if identity in stored_keywords else "System Generated"
+
+
+def mapper_stored_keyword_identities(keyword_rows):
+    return {(mapper_text(row.get("language")).lower(), audit_text_key(row.get("keyword")))
+            for row in keyword_rows.to_dict("records") if mapper_text(row.get("keyword"))}
+
+
 def mapper_generate(keywords, bases, database, model=None, threshold=.35):
     lookup = mapper_priority_lookup(database)
+    with get_connection() as conn:
+        mapper_initialize_global_keyword_store(conn)
+        stored_keywords = mapper_stored_keyword_identities(pd.read_sql_query(
+            "SELECT keyword, language FROM internal_pattern_keyword_training", conn))
     output = []
     for row in bases.to_dict("records"):
         domain, basis, language = row["domain"], row["basis"], row["language"]
@@ -2969,7 +2985,9 @@ def mapper_generate(keywords, bases, database, model=None, threshold=.35):
             output.append({"domain":domain,"basis":basis,"keyword":keyword,"language":language,
                            "rank":1,"priority":priority,
                            "database status":"already present" if existing is not None else "",
-                           "mapping status":status})
+                           "mapping status":status,
+                           "Keyword Source": mapper_keyword_source(keyword, language, stored_keywords)
+                               if status == "MODEL GENERATION" else ("Performance CSV" if keyword else "")})
     return pd.DataFrame(output, columns=MAPPER_OUTPUT_COLUMNS)
 
 
@@ -3094,6 +3112,7 @@ def keyword_mapper_page():
     st.success(f"CSV mapped: {mapped:,} | MODEL GENERATION: {generated:,} | Unfilled: {blank:,}")
     if generated:
         st.info("Purple MODEL GENERATION rows are suggestions from the learned workbook model. Review them before using the CSV.")
+    st.caption("Keyword Source: From Database means the suggested keyword exists in the shared keyword store for this language; System Generated means it is new. Performance CSV identifies directly mapped CSV terms.")
     st.caption("These are results from your last run. Run mapping or generation again after changing inputs.")
     st.dataframe(result.style.apply(mapper_highlight,axis=1),hide_index=True,use_container_width=True)
     st.download_button("Download Mapped Keywords CSV",result.to_csv(index=False).encode("utf-8-sig"),
@@ -3302,6 +3321,7 @@ def performance_existing_basis_keywords(keyword_rows):
 def performance_replacement_slots(deletion, patterns, keyword_rows, model):
     rows = []
     existing_keywords = performance_existing_basis_keywords(keyword_rows)
+    stored_keywords = mapper_stored_keyword_identities(keyword_rows)
     suggested_keywords = {}
     priorities = mapper_priority_lookup(patterns)
     for (domain, basis, language), group in deletion.groupby(["domain", "basis", "languagecode"], sort=False):
@@ -3333,7 +3353,8 @@ def performance_replacement_slots(deletion, patterns, keyword_rows, model):
             keyword = suggestions[slot] if slot < len(suggestions) else ""
             rows.append({"Select": bool(keyword), "domain": domain, "basis": basis, "keywords": keyword,
                          "languagecode": language, "priority": priority,
-                         "Suggestion status": "MODEL GENERATION" if keyword else "Enter a replacement keyword"})
+                         "Suggestion status": "MODEL GENERATION" if keyword else "Enter a replacement keyword",
+                         "Keyword Source": mapper_keyword_source(keyword, language, stored_keywords)})
     return pd.DataFrame(rows)
 
 
@@ -3473,14 +3494,20 @@ def underperforming_pairs_page():
             state["editor_sig"] = editor_sig
         suggestions = state["editor_baseline"]
         edited = st.data_editor(suggestions, hide_index=True, use_container_width=True, num_rows="dynamic",
-            disabled=["Suggestion status"],
+            disabled=["Suggestion status", "Keyword Source"],
             column_config={"Select": st.column_config.CheckboxColumn("Select"),
                            "domain": st.column_config.SelectboxColumn("domain", options=domains, required=True),
                            "languagecode": st.column_config.SelectboxColumn("languagecode", options=languages, required=True),
                            "priority": st.column_config.NumberColumn("priority", min_value=0, step=1, required=True)},
             key=f"perf_replacements_{revision}_{state['replacement_revision']}_{editor_sig}")
-        # Preserve edits across domain-option changes without reusing a changed editor baseline.
+        # Recalculate source after user edits a suggested keyword or its language.
+        stored_keywords = mapper_stored_keyword_identities(keyword_rows)
+        edited["Keyword Source"] = edited.apply(
+            lambda row: mapper_keyword_source(row["keywords"], row["languagecode"], stored_keywords), axis=1)
         state["replacement_latest"] = edited.copy()
+        st.dataframe(edited[["basis", "keywords", "languagecode", "Keyword Source"]],
+                     hide_index=True, use_container_width=True)
+        # Preserve edits across domain-option changes without reusing a changed editor baseline.
         st.caption("Select any number of keywords; add or remove rows as needed. Choose a domain and priority for each replacement. Language-specific domains must match languagecode. Promote domains use the set ID entered above.")
         upload_signature = hashlib.sha256((edited.to_json() + json.dumps(domains)).encode()).hexdigest()
         if st.button("Generate Upload Sheet", type="primary", key="perf_upload"):
