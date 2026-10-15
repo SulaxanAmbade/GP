@@ -2180,7 +2180,55 @@ def performance_live_index(patterns, keyword_rows):
     return index
 
 
-def prepare_performance_review(frame, columns, patterns, keyword_rows):
+PERFORMANCE_RULE_METRICS = {
+    "RPM":"rpm", "Keyword Impressions":"impressions", "Revenue":"revenue",
+    "Keyword Clicks":"clicks", "Ad Clicks":"ad_clicks", "L2R":"l2r", "RPC":"rpc",
+}
+
+
+def performance_check_conditions(minimum_impressions=1000, mode="All conditions", rules=None):
+    minimum = coverage_priority_value(minimum_impressions)
+    if not minimum.is_finite() or minimum!=minimum.to_integral_value():
+        raise ValueError("Minimum impressions must be a nonnegative whole number.")
+    if mode not in {"All conditions","Any condition"}:
+        raise ValueError("Choose All conditions or Any condition.")
+    if rules is None:
+        rules = [{"Metric":"RPM","Operator":"<","Compare To":"Basis Average","Value":100.0}]
+    checked = []
+    for position,rule in enumerate(rules,1):
+        metric,operator,target = (keyword_text(rule.get(field)) for field in ("Metric","Operator","Compare To"))
+        if not any((metric,operator,target)):
+            continue
+        if metric not in PERFORMANCE_RULE_METRICS or operator not in {"<","<=",">",">=","=","!="} or target not in {"Fixed Value","Basis Average","Basis Average %"}:
+            raise ValueError(f"Condition {position}: choose a metric, operator and comparison type.")
+        value = None
+        if target!="Basis Average":
+            number = coverage_priority_value(rule.get("Value"))
+            if not number.is_finite():
+                raise ValueError(f"Condition {position}: enter a finite, nonnegative value.")
+            value = float(number)
+            if value in {float("inf"),float("-inf")}:
+                raise ValueError(f"Condition {position}: the value is too large.")
+        checked.append(dict(metric=PERFORMANCE_RULE_METRICS[metric],label=metric,operator=operator,target=target,value=value))
+    return dict(minimum_impressions=int(minimum),mode=mode,rules=checked)
+
+
+def performance_conditions_mask(pairs, conditions):
+    result = pd.Series(conditions["mode"]=="All conditions",index=pairs.index,dtype=bool)
+    if not conditions["rules"]:
+        return pd.Series(True,index=pairs.index,dtype=bool)
+    for rule in conditions["rules"]:
+        values = pairs[rule["metric"]]
+        target = rule["value"] if rule["target"]=="Fixed Value" else pairs["basis_average_"+rule["metric"]]
+        if rule["target"]=="Basis Average %":
+            target = target*rule["value"]/100.
+        matches = {"<":values.lt,"<=":values.le,">":values.gt,">=":values.ge,"=":values.eq,"!=":values.ne}[rule["operator"]](target)
+        result = result & matches if conditions["mode"]=="All conditions" else result | matches
+    return result
+
+
+def prepare_performance_review(frame, columns, patterns, keyword_rows, conditions=None):
+    conditions = conditions or performance_check_conditions()
     for field in ("basis", "keyword", "impressions", "rpm"):
         if not columns.get(field):
             raise ValueError(f"Choose the {field} column.")
@@ -2190,6 +2238,8 @@ def prepare_performance_review(frame, columns, patterns, keyword_rows):
     source, removed = remove_pair_report_total_rows(frame, columns["basis"], columns["keyword"])
     removed += frame.attrs.get("excluded_report_rows", 0)
     source = source.loc[~source.apply(lambda row: all(not keyword_text(v) for v in row), axis=1)].reset_index(drop=True)
+    if source.empty:
+        return pd.DataFrame(),{},dict(pairs=0,eligible=0,underperforming=0,removed=removed)
     data = pd.DataFrame(index=source.index)
     for field in ("basis", "keyword", "language", "domain"):
         data[field] = source[columns[field]].map(keyword_text) if columns.get(field) else ""
@@ -2197,6 +2247,14 @@ def prepare_performance_review(frame, columns, patterns, keyword_rows):
         raise ValueError("Every data row requires a basis and keyword.")
     data["impressions"] = audit_count_values(source[columns["impressions"]], "Keyword impressions")
     data["rpm"] = performance_number(source[columns["rpm"]], "Pair RPM")
+    used_metrics = {rule["metric"] for rule in conditions["rules"]} | {"rpm","impressions"}
+    if "rpc" in used_metrics and columns.get("clicks"):
+        used_metrics.add("clicks")
+    for field in used_metrics - {"rpm","impressions"}:
+        if not columns.get(field):
+            raise ValueError(f"Choose the {field} CSV column to use it in a condition.")
+        data[field] = (audit_count_values(source[columns[field]],field) if field in {"clicks","ad_clicks"}
+                       else performance_number(source[columns[field]],field))
     data["basis_key"] = data["basis"].map(audit_pattern_key)
     data["keyword_key"] = data["keyword"].map(audit_text_key)
     data["language"] = data["language"].str.lower()
@@ -2204,31 +2262,51 @@ def prepare_performance_review(frame, columns, patterns, keyword_rows):
     data["weighted_rpm"] = data["impressions"] * data["rpm"]
     data["source_row"] = source.index
     keys = ["basis_key", "keyword_key", "language", "domain"]
-    totals = data.groupby(keys, as_index=False, sort=False).agg(
-        impressions=("impressions", "sum"), weighted_rpm=("weighted_rpm", "sum"),
-        source_rows=("source_row", list))
+    aggregation = dict(impressions=("impressions","sum"),weighted_rpm=("weighted_rpm","sum"),
+                       reported_rpm=("rpm","mean"),source_rows=("source_row",list))
+    for field in used_metrics - {"rpm","impressions"}:
+        if field in {"revenue","clicks","ad_clicks"}:
+            aggregation[field] = (field,"sum")
+        else:
+            data["weighted_"+field] = data[field]*data["impressions"]
+            aggregation["weighted_"+field] = ("weighted_"+field,"sum")
+            aggregation["reported_"+field] = (field,"mean")
+    if "rpc" in used_metrics and "clicks" in used_metrics:
+        data["click_weighted_rpc"] = data["rpc"]*data["clicks"]
+        aggregation["click_weighted_rpc"] = ("click_weighted_rpc","sum")
+    totals = data.groupby(keys, as_index=False, sort=False).agg(**aggregation)
     index = performance_live_index(patterns, keyword_rows)
     eligible = []
     for pair in totals.to_dict("records"):
         matches = index.get((pair["basis_key"], pair["keyword_key"]), [])
         matches = [m for m in matches if (not pair["language"] or m["languagecode"] == pair["language"])
                    and (not pair["domain"] or keyword_domain_key(m["domain"]) == pair["domain"])]
-        if pair["impressions"] >= 1000 and matches:
-            pair["rpm"] = pair["weighted_rpm"] / pair["impressions"]
+        if pair["impressions"] >= conditions["minimum_impressions"] and matches:
+            pair["rpm"] = pair["weighted_rpm"] / pair["impressions"] if pair["impressions"] else pair["reported_rpm"]
+            for field in used_metrics & {"l2r","rpc"}:
+                pair[field] = pair["weighted_"+field]/pair["impressions"] if pair["impressions"] else pair["reported_"+field]
+            if "rpc" in used_metrics and pair.get("clicks",0)>0:
+                pair["rpc"] = pair["click_weighted_rpc"]/pair["clicks"]
             pair["matches"] = matches
             eligible.append(pair)
     pairs = pd.DataFrame(eligible)
     review_rows, exports = [], {}
     if not pairs.empty:
-        pairs["average"] = pairs.groupby(["basis_key", "language", "domain"])["rpm"].transform("mean")
-        for pair_id, pair in enumerate(pairs.loc[pairs["rpm"].lt(pairs["average"])].to_dict("records")):
+        for field in used_metrics:
+            pairs["basis_average_"+field] = pairs.groupby(["basis_key","language","domain"])[field].transform("mean")
+        pairs["average"] = pairs["basis_average_rpm"]
+        for pair_id, pair in enumerate(pairs.loc[performance_conditions_mask(pairs,conditions)].to_dict("records")):
             exports[pair_id] = pair["matches"]
             for row_id in pair["source_rows"]:
                 review_rows.append({"Select for deletion": False, **source.iloc[row_id].to_dict(),
                                     "Review: Pair impressions": pair["impressions"],
                                     "Review: Pair RPM": pair["rpm"], "Review: Basis average RPM": pair["average"],
-                                    "Review: Pair ID": pair_id})
+                                    "Review: Pair ID": pair_id,
+                                    **{"Review: Pair "+label:pair[field] for label,field in PERFORMANCE_RULE_METRICS.items() if field in used_metrics and field not in {"rpm","impressions"}},
+                                    **{"Review: Basis average "+label:pair["basis_average_"+field] for label,field in PERFORMANCE_RULE_METRICS.items() if field in used_metrics and field not in {"rpm"}}})
     reserved = {"Select for deletion", "Review: Pair impressions", "Review: Pair RPM", "Review: Basis average RPM", "Review: Pair ID"}
+    reserved.update("Review: Pair "+label for label in PERFORMANCE_RULE_METRICS)
+    reserved.update("Review: Basis average "+label for label in PERFORMANCE_RULE_METRICS)
     if reserved.intersection(source.columns):
         raise ValueError("Rename CSV columns that conflict with reserved review column names.")
     review = pd.DataFrame(review_rows)
@@ -2323,7 +2401,7 @@ def performance_upload_sheet(edited, deletion, allowed_domains, patterns, keywor
 def underperforming_pairs_page():
     st.header("Keyword Performance Check")
     st.write("Select existing underperforming pairs, generate a deletion sheet, then enter replacement keywords manually and generate an upload sheet.")
-    st.caption("Minimum: 1,000 impressions per pair; no click minimum. Duplicate pair RPM is weighted by impressions. Basis average is the simple mean RPM of existing pairs meeting the minimum, within the CSV language/domain when supplied. Equal RPM is excluded. Without those columns, every exact stored mapping is shown in the deletion preview.")
+    st.caption("Set your base threshold and metric rules below. Only existing shared-database pairs qualify. Basis averages use existing pairs meeting the minimum impressions, within the CSV language/domain when supplied, before metric rules are applied.")
     file = st.file_uploader("Performance CSV", type=["csv"], key="performance_workflow_file")
     if file is None:
         return
@@ -2344,25 +2422,37 @@ def underperforming_pairs_page():
                 columns[field] = st.selectbox(field, options, index=options.index(detected[0]) if len(detected) == 1 else 0,
                     format_func=lambda value: "Not mapped" if value is None else value,
                     key=f"perf_map_{digest}_{field}")
+        with st.expander("Performance Check Conditions",expanded=True):
+            minimum_impressions = st.number_input("Minimum Pair Impressions",min_value=0,value=1000,step=100,key="perf_minimum_impressions")
+            mode = st.radio("Match Rules",["All conditions","Any condition"],horizontal=True,key="perf_conditions_mode")
+            rule_rows = st.data_editor(pd.DataFrame([{"Metric":"RPM","Operator":"<","Compare To":"Basis Average","Value":100.0}]),
+                num_rows="dynamic",hide_index=True,use_container_width=True,key="perf_conditions_editor",
+                column_config={"Metric":st.column_config.SelectboxColumn("Metric",options=list(PERFORMANCE_RULE_METRICS),required=True),
+                    "Operator":st.column_config.SelectboxColumn("Operator",options=["<","<=",">",">=","=","!="],required=True),
+                    "Compare To":st.column_config.SelectboxColumn("Compare To",options=["Fixed Value","Basis Average","Basis Average %"],required=True),
+                    "Value":st.column_config.NumberColumn("Value",min_value=0.0,help="Fixed threshold, or percentage of basis average. Ignored for Basis Average.")})
+            st.caption("Examples: Keyword Clicks < Fixed Value 5; RPM < Basis Average; RPM < Basis Average % 80 (below 80% of the average). Add/remove rows to customize. Removing all rules lists all existing pairs meeting the impression threshold.")
+            st.caption("Duplicates: counts and revenue are summed; RPM/L2R use impression weights. RPC uses keyword-click weights when that column is mapped, otherwise impression weights. Zero-weight groups use the mean reported rate. Percentages use the numeric scale in your CSV, e.g. enter 5 for values written as 5%.")
+            conditions = performance_check_conditions(minimum_impressions,mode,rule_rows.to_dict("records"))
         with get_connection() as conn:
             initialize_keyword_store(conn)
             patterns = pd.read_sql_query("SELECT url_pattern, language_code, admin_name, priority FROM url_patterns", conn)
             keyword_rows = pd.read_sql_query("SELECT source_pattern, keyword, language, source_admin_name FROM internal_pattern_keyword_training", conn)
-        signature = hashlib.sha256((digest + json.dumps(columns, sort_keys=True) + patterns.to_json() + keyword_rows.to_json()).encode()).hexdigest()
+        signature = hashlib.sha256((digest + json.dumps(columns, sort_keys=True) + json.dumps(conditions,sort_keys=True) + patterns.to_json() + keyword_rows.to_json()).encode()).hexdigest()
         if st.button("Check Keyword Performance", type="primary", key="perf_check"):
             if keyword_rows.empty:
                 raise ValueError("Upload and confirm a shared workbook containing pattern_keywords first.")
-            review, exports, stats = prepare_performance_review(frame, columns, patterns, keyword_rows)
+            review, exports, stats = prepare_performance_review(frame, columns, patterns, keyword_rows,conditions)
             st.session_state["perf_manual_workflow"] = dict(signature=signature, review=review, exports=exports, stats=stats,
                                                     revision=st.session_state.get("perf_revision", 0) + 1)
             st.session_state["perf_revision"] = st.session_state["perf_manual_workflow"]["revision"]
         state = st.session_state.get("perf_manual_workflow")
         if not state or state["signature"] != signature:
-            st.info("Run the check for the current CSV, column mapping and shared dataset.")
+            st.info("Run the check for the current CSV, column mapping, conditions and shared dataset.")
             return
         revision = state["revision"]
         stats = state["stats"]
-        st.success(f"Pairs: {stats['pairs']:,} | Existing pairs with ≥1,000 impressions: {stats['eligible']:,} | Below basis average: {stats['underperforming']:,}")
+        st.success(f"Pairs: {stats['pairs']:,} | Existing pairs with ≥{conditions['minimum_impressions']:,} impressions: {stats['eligible']:,} | Matching your conditions: {stats['underperforming']:,}")
         if stats["removed"]:
             st.caption(f"Removed {stats['removed']:,} report total rows.")
         if state["review"].empty:
