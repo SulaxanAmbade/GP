@@ -795,7 +795,7 @@ def get_url_parts(url):
     return _cached_get_url_parts(str(url))
 
 
-@processing_lru_cache(maxsize=16384)
+@processing_lru_cache(maxsize=4096)
 def coverage_url_parts(url):
     """Match the complete split basis against hostname and URL content."""
     raw_url = str(url).strip()
@@ -866,7 +866,7 @@ def coverage_first_priority(values):
     return str(min(usable, key=coverage_priority_value)).strip() if usable else ""
 
 
-@st.cache_data(show_spinner=False, max_entries=4)
+@st.cache_data(show_spinner=False, max_entries=1)
 def make_basis_catalog(pattern_df):
     columns = [
         "domain", "normalized_domain", "basis", "normalized_basis",
@@ -923,11 +923,20 @@ def coerce_metric(series):
 
 
 def read_coverage_csv(uploaded_file):
-    return _cached_coverage_csv(uploaded_file.getvalue()).copy(deep=True)
+    raw = uploaded_file.getvalue()
+    # Large uploads already live in Streamlit's upload buffer. Do not retain
+    # another raw-file cache key and complete parsed DataFrame indefinitely.
+    if len(raw) > 8 * 1024 * 1024:
+        return _parse_coverage_csv(raw)
+    return _cached_coverage_csv(raw).copy(deep=True)
 
 
-@processing_lru_cache(maxsize=2)
+@processing_lru_cache(maxsize=1)
 def _cached_coverage_csv(raw):
+    return _parse_coverage_csv(raw)
+
+
+def _parse_coverage_csv(raw):
     from io import BytesIO
     last_error = None
     for encoding in ("utf-8-sig", "utf-16", "latin-1"):
@@ -985,13 +994,11 @@ def _coverage_word_forms(word):
     return frozenset(forms)
 
 
-@processing_lru_cache(maxsize=4)
+@processing_lru_cache(maxsize=1)
 def _coverage_basis_index(bases):
-    """Index contiguous fragments; wildcard-separated fragments may reorder."""
-    children = [{}]
-    form_edges = [{}]
-    exact_edges = [{}]
-    terminals = [[]]
+    """Compact trie: one edge table per branching node; no tables on leaves."""
+    children = [None]
+    terminals = {}
     fragment_ids = {}
     watchers = []
     condition_counts = []
@@ -1007,40 +1014,44 @@ def _coverage_basis_index(bases):
                 watchers.append({})
                 node = 0
                 for word in fragment:
-                    child = children[node].get(word)
+                    edges = children[node]
+                    if edges is None:
+                        edges = children[node] = {}
+                    child = edges.get(word)
                     if child is None:
                         child = len(children)
-                        children[node][word] = child
-                        children.append({})
-                        form_edges.append({})
-                        exact_edges.append({})
-                        terminals.append([])
-                        if word.startswith("~") and word.endswith("~"):
-                            exact_edges[node].setdefault(word[1:-1], set()).add(child)
-                        else:
-                            form_edges[node].setdefault(word, set()).add(child)
+                        edges[word] = child
+                        children.append(None)
                     node = child
-                terminals[node].append(fragment_id)
+                terminals.setdefault(node, []).append(fragment_id)
             watchers[fragment_id].setdefault(occurrences, []).append(basis_id)
-    return form_edges, exact_edges, terminals, watchers, condition_counts
+    return children, terminals, watchers, condition_counts
 
 
 def _coverage_match_ids(searchable_url, index):
-    form_edges, exact_edges, terminals, watchers, condition_counts = index
+    children, terminals, watchers, condition_counts = index
     active = set()
     occurrences = Counter()
     satisfied = Counter()
     matches = set()
     for word in searchable_url.split():
         forms = _coverage_word_forms(word)
+        locked_word = f"~{word}~"
         next_active = set()
         for node in active | {0}:
             # Tilde locks match the original token, not its singular forms.
-            next_active.update(exact_edges[node].get(word, ()))
+            edges = children[node]
+            if edges is None:
+                continue
+            child = edges.get(locked_word)
+            if child is not None:
+                next_active.add(child)
             for form in forms:
-                next_active.update(form_edges[node].get(form, ()))
+                child = edges.get(form)
+                if child is not None:
+                    next_active.add(child)
         found_fragments = {
-            fragment_id for node in next_active for fragment_id in terminals[node]
+            fragment_id for node in next_active for fragment_id in terminals.get(node, ())
         }
         for fragment_id in found_fragments:
             occurrences[fragment_id] += 1
@@ -1100,18 +1111,16 @@ def create_coverage_report(input_df, basis_catalog, selected_languages=None):
     ))
     order_rank = {basis_id:rank for rank,basis_id in enumerate(match_order)}
     index = _coverage_basis_index(tuple(str(row[0]) for row in records))
-    url_matches = {}
     summary_rows = []
     detail_rows = []
     for url, impressions, revenue in prepared[[
         "URL", "Keyword Impressions", "Revenue",
     ]].itertuples(index=False, name=None):
         domain, searchable_url = coverage_url_parts(url)
-        ids = url_matches.get(searchable_url)
-        if ids is None:
-            matches = _coverage_match_ids(searchable_url, index)
-            ids = [min(matches,key=order_rank.__getitem__)] if matches else []
-            url_matches[searchable_url] = ids
+        # URLs are already grouped above. Keeping all normalized URLs again
+        # doubles their storage and gives almost no reuse with host matching.
+        matches = _coverage_match_ids(searchable_url, index)
+        ids = [min(matches,key=order_rank.__getitem__)] if matches else []
         if not ids:
             summary_rows.append((
                 url, domain, language_label, "No Matching Basis", 0,
@@ -1295,12 +1304,17 @@ def render_coverage_results(report, title, key_prefix):
     metric2.metric("Covered URLs", f"{covered_urls:,}")
     metric3.metric("No Matching Basis", f"{total_urls - covered_urls:,}")
     metric4.metric("Coverage Rate", f"{covered_urls / total_urls * 100 if total_urls else 0:.1f}%")
-    st.dataframe(url_summary_df, use_container_width=True, hide_index=True)
-    st.download_button(
-        "Download Priority URL Summary", data=url_summary_df.to_csv(index=False),
-        file_name=f"{key_prefix}_priority_url_summary.csv", mime="text/csv",
-        use_container_width=True, key=f"{key_prefix}_download_summary",
-    )
+    preview_limit = 2000
+    large_report = len(url_summary_df) > 10000
+    if len(url_summary_df) > preview_limit:
+        st.caption(f"Showing the first {preview_limit:,} of {len(url_summary_df):,} URLs. CSV downloads contain every row.")
+    st.dataframe(url_summary_df.head(preview_limit), use_container_width=True, hide_index=True)
+    if not large_report:
+        st.download_button(
+            "Download Priority URL Summary", data=url_summary_df.to_csv(index=False),
+            file_name=f"{key_prefix}_priority_url_summary.csv", mime="text/csv",
+            use_container_width=True, key=f"{key_prefix}_download_summary",
+        )
     with st.expander("Coverage Summary, Basis Performance, and Match Details", expanded=False):
         summary_tab, basis_tab, detail_tab = st.tabs([
             "Coverage Summary", "Basis Performance", "Match Details",
@@ -1308,29 +1322,47 @@ def render_coverage_results(report, title, key_prefix):
         with summary_tab:
             st.dataframe(coverage_pivot, use_container_width=True, hide_index=True)
         with basis_tab:
-            st.dataframe(basis_pivot, use_container_width=True, hide_index=True)
+            st.dataframe(basis_pivot.head(preview_limit), use_container_width=True, hide_index=True)
             st.caption(
                 "Each URL's performance is attributed only to its selected basis. "
                 "The lowest numeric priority wins; equal priorities prefer the longer basis."
             )
         with detail_tab:
-            st.dataframe(detail_df, use_container_width=True, hide_index=True)
-        download1, download2 = st.columns(2)
-        download1.download_button(
-            "Download Basis Report", data=basis_pivot.to_csv(index=False),
-            file_name=f"{key_prefix}_basis_report.csv", mime="text/csv",
-            use_container_width=True, key=f"{key_prefix}_download_basis",
-        )
-        download2.download_button(
-            "Download Match Details", data=detail_df.to_csv(index=False),
-            file_name=f"{key_prefix}_match_details.csv", mime="text/csv",
-            use_container_width=True, key=f"{key_prefix}_download_details",
-        )
+            st.dataframe(detail_df.head(preview_limit), use_container_width=True, hide_index=True)
+            if len(detail_df) > preview_limit:
+                st.caption(f"Preview limited to {preview_limit:,} rows. Download the CSV for all match details.")
+        if not large_report:
+            download1, download2 = st.columns(2)
+            download1.download_button(
+                "Download Basis Report", data=basis_pivot.to_csv(index=False),
+                file_name=f"{key_prefix}_basis_report.csv", mime="text/csv",
+                use_container_width=True, key=f"{key_prefix}_download_basis",
+            )
+            download2.download_button(
+                "Download Match Details", data=detail_df.to_csv(index=False),
+                file_name=f"{key_prefix}_match_details.csv", mime="text/csv",
+                use_container_width=True, key=f"{key_prefix}_download_details",
+            )
+    if large_report:
+        exports = {
+            "Priority URL Summary": (url_summary_df, "priority_url_summary"),
+            "Basis Report": (basis_pivot, "basis_report"),
+            "Match Details": (detail_df, "match_details"),
+        }
+        st.caption("Choose one full CSV to prepare. Large reports prepare one download at a time to conserve memory.")
+        choice = st.selectbox("Prepare CSV download", ["Choose a report"] + list(exports), key=f"{key_prefix}_export_choice")
+        if choice in exports:
+            frame, suffix = exports[choice]
+            st.download_button(
+                f"Download {choice}", data=frame.to_csv(index=False),
+                file_name=f"{key_prefix}_{suffix}.csv", mime="text/csv",
+                key=f"{key_prefix}_large_download",
+            )
 
 
 def clear_coverage_reports():
     for key in list(st.session_state):
-        if key.startswith(("coverage_excluded_basis_keys_", "coverage_exclusion_search_", "coverage_exclude_caught_editor_")):
+        if key.startswith(("coverage_excluded_basis_keys_", "coverage_exclusion_search_", "coverage_exclude_caught_editor_", "coverage_new_basis_rows_", "coverage_new_basis_page_")):
             st.session_state.pop(key,None)
     for key in (
         "coverage_report", "coverage_report_language", "coverage_report_languages", "coverage_report_input",
@@ -1447,6 +1479,7 @@ def render_coverage_report(final_df):
                         prepared_input["URL"].notna()
                         & prepared_input["URL"].astype(str).str.strip().ne("")
                     ].copy()
+                    del source_df
             except Exception as err:
                 st.error(f"Could not read the CSV: {err}")
     removed_total_rows = 0
@@ -1465,12 +1498,13 @@ def render_coverage_report(final_df):
         disabled=prepared_input is None or prepared_input.empty,
     ):
         with st.spinner("Checking URL coverage..."):
-            report = create_coverage_report(prepared_input, basis_catalog)
+            # Release previous reports before allocating replacements.
             clear_coverage_reports()
+            report = create_coverage_report(prepared_input, basis_catalog)
             st.session_state["coverage_report"] = report
             st.session_state["coverage_report_languages"] = selected_languages
             # Rechecks always use the same input, including performance metrics.
-            st.session_state["coverage_report_input"] = prepared_input.copy()
+            st.session_state["coverage_report_input"] = prepared_input
             st.session_state["coverage_report_catalog_signature"] = catalog_signature
             st.session_state["coverage_report_revision"] = (
                 st.session_state.get("coverage_report_revision", 0) + 1
@@ -1502,6 +1536,9 @@ def render_coverage_report(final_df):
                                      for row in caught_choices.to_dict("records")]
         search = st.text_input("Search Caught Bases",placeholder="Example: heart health or blood*sugar",key=f"coverage_exclusion_search_{revision}")
         visible = coverage_filter_caught_bases(caught_choices,search)
+        if len(visible) > 2000:
+            st.caption("Showing the first 2,000 matching bases. Use Search Caught Bases to narrow the list and edit further bases.")
+            visible = visible.head(2000)
         query_key = hashlib.sha256(str(search).encode()).hexdigest()[:12]
         excluded_choices = caught_choices
         if visible.empty:
@@ -1534,10 +1571,21 @@ def render_coverage_report(final_df):
     if editor_input.empty:
         edited_rows = editor_input
     else:
+        # Keep all edits server-side while sending a bounded page to the editor.
+        editor_page = 0
+        if len(editor_input) > 1000:
+            rows_key = f"coverage_new_basis_rows_{revision}"
+            if rows_key not in st.session_state:
+                st.session_state[rows_key] = editor_input
+            editor_input = st.session_state[rows_key]
+            pages = (len(editor_input) + 999) // 1000
+            editor_page = int(st.number_input("New basis page", min_value=1, max_value=pages, value=1, step=1,
+                key=f"coverage_new_basis_page_{revision}")) - 1
+            st.caption(f"Page {editor_page + 1:,} of {pages:,}. Edits on other pages are retained.")
         edited_rows = st.data_editor(
-            editor_input, hide_index=True, use_container_width=True,
+            editor_input.iloc[editor_page * 1000:(editor_page + 1) * 1000], hide_index=True, use_container_width=True,
             num_rows="fixed", disabled=["URL"],
-            key=f"coverage_new_basis_priority_editor_{revision}",
+            key=f"coverage_new_basis_priority_editor_{revision}_{editor_page}",
             column_config={
                 "URL": st.column_config.TextColumn("No Matching Basis URL", width="large"),
                 "New Basis": st.column_config.TextColumn("New Basis",width="large",help="Example: bug*bite; heart*health"),
@@ -1548,6 +1596,10 @@ def render_coverage_report(final_df):
                 ),
             },
         )
+        if len(editor_input) > 1000:
+            columns_to_edit = ["New Basis", "Language Code", "Priority"]
+            editor_input.loc[edited_rows.index, columns_to_edit] = edited_rows[columns_to_edit]
+            edited_rows = editor_input
     combined_catalog, additions, invalid = add_user_coverage_bases(
         basis_catalog, edited_rows, selected_languages,
     )
@@ -1567,6 +1619,7 @@ def render_coverage_report(final_df):
         key="coverage_recheck_button",
     ):
         with st.spinner("Checking coverage with exclusions and new bases..."):
+            st.session_state.pop("coverage_recheck_report", None)
             st.session_state["coverage_recheck_report"] = create_coverage_report(
                 st.session_state["coverage_report_input"], remaining_catalog, selected_languages=selected_languages,
             )
