@@ -153,6 +153,27 @@ PATTERN_COLUMNS = [
 ]
 
 
+@st.cache_resource(show_spinner=False)
+def _processing_lru_registry():
+    from threading import RLock
+    return {},RLock()
+
+
+def processing_lru_cache(maxsize):
+    """Keep bounded LRU wrappers alive across Streamlit script reruns."""
+    def decorate(function):
+        import marshal
+        token = (maxsize,hashlib.sha256(marshal.dumps(function.__code__)).hexdigest())
+        registry,lock = _processing_lru_registry()
+        with lock:
+            previous = registry.get(function.__name__)
+            if previous is None or previous[0]!=token:
+                previous = (token,lru_cache(maxsize=maxsize)(function))
+                registry[function.__name__] = previous
+            return previous[1]
+    return decorate
+
+
 def get_connection():
     return sqlite3.connect(DB_FILE, check_same_thread=False)
 
@@ -189,6 +210,69 @@ def initialize_database():
         conn.close()
 
 
+@processing_lru_cache(maxsize=2)
+def _database_revision_monitor(path, device, inode):
+    from threading import RLock
+    # PRAGMA data_version must use the same connection between checks. It
+    # detects commits from other users/processes, including WAL-mode commits.
+    return sqlite3.connect(path,check_same_thread=False),RLock()
+
+
+def database_revision():
+    path = os.path.abspath(os.fspath(DB_FILE))
+    info = os.stat(path)
+    connection,lock = _database_revision_monitor(path,info.st_dev,info.st_ino)
+    with lock:
+        cursor = connection.execute("PRAGMA data_version")
+        try:
+            version = cursor.fetchone()[0]
+        finally:
+            cursor.close()
+    return (path,info.st_dev,info.st_ino,info.st_size,info.st_mtime_ns,info.st_ctime_ns,version)
+
+
+@processing_lru_cache(maxsize=1)
+def _cached_performance_snapshot(revision):
+    if database_revision()!=revision:
+        raise ValueError("The shared dataset changed. Run the check again.")
+    conn = sqlite3.connect(revision[0])
+    try:
+        initialize_keyword_store(conn)
+        conn.commit()
+        conn.execute("BEGIN")
+        patterns = pd.read_sql_query("SELECT url_pattern, language_code, admin_name, priority FROM url_patterns",conn)
+        keywords = pd.read_sql_query("SELECT source_pattern, keyword, language, source_admin_name FROM internal_pattern_keyword_training",conn)
+        return patterns,keywords
+    finally:
+        conn.close()
+
+
+def load_performance_snapshot():
+    for attempt in range(3):
+        revision = database_revision()
+        try:
+            patterns,keywords = _cached_performance_snapshot(revision)
+        except ValueError:
+            if database_revision()!=revision:
+                continue
+            raise
+        if database_revision()==revision:
+            # Internal callers treat these cached frames as read-only.
+            return revision,patterns,keywords
+    raise ValueError("The shared dataset is being updated. Run the check again when the update finishes.")
+
+
+@processing_lru_cache(maxsize=1)
+def _cached_performance_index(revision):
+    patterns,keywords = _cached_performance_snapshot(revision)
+    return performance_live_index(patterns,keywords)
+
+
+@processing_lru_cache(maxsize=1)
+def _cached_existing_basis_keywords(revision):
+    return performance_existing_basis_keywords(_cached_performance_snapshot(revision)[1])
+
+
 def get_dataset_metadata():
     conn = get_connection()
     try:
@@ -202,7 +286,17 @@ def get_dataset_metadata():
 
 
 def load_shared_dataset():
-    conn = get_connection()
+    for attempt in range(3):
+        revision = database_revision()
+        frame = _cached_shared_dataset(revision)
+        if database_revision()==revision:
+            return frame.copy(deep=True)
+    raise ValueError("The shared dataset is being updated. Please retry.")
+
+
+@processing_lru_cache(maxsize=1)
+def _cached_shared_dataset(revision):
+    conn = sqlite3.connect(revision[0])
     try:
         df = pd.read_sql_query("""
             SELECT url_pattern, url_pattern_id, priority, language_code,
@@ -257,6 +351,10 @@ def replace_shared_dataset(new_df, filename, file_date, updated_by, pattern_keyw
         ))
         store_pattern_keyword_rows(conn, pattern_keyword_rows, filename)
         conn.commit()
+        _cached_performance_snapshot.cache_clear()
+        _cached_performance_index.cache_clear()
+        _cached_existing_basis_keywords.cache_clear()
+        _cached_shared_dataset.cache_clear()
     except Exception:
         conn.rollback()
         raise
@@ -607,6 +705,11 @@ def parse_uploaded_file(uploaded_file):
 # NORMALIZATION AND MATCHING
 # =============================================================
 def normalize_search_text(text):
+    return _cached_normalize_search_text(str(text))
+
+
+@processing_lru_cache(maxsize=32768)
+def _cached_normalize_search_text(text):
     text = unquote(str(text)).replace("+", " ")
     text = re.sub(r"[-_/\\*]+", " ", text)
     text = re.sub(r"[^a-zA-Z0-9\s]", " ", text)
@@ -653,6 +756,11 @@ def normalized_pattern_match(normalized_search, normalized_pattern):
 
 
 def split_domain_basis(pattern):
+    return _cached_split_domain_basis(str(pattern))
+
+
+@processing_lru_cache(maxsize=32768)
+def _cached_split_domain_basis(pattern):
     # Remove exactly one outer wrapper, retaining extra basis wildcards.
     pattern = str(pattern).strip().replace("\\*", "*")
     if "*" not in pattern:
@@ -667,6 +775,11 @@ def split_domain_basis(pattern):
 
 
 def normalize_domain(value):
+    return _cached_normalize_domain(str(value))
+
+
+@processing_lru_cache(maxsize=32768)
+def _cached_normalize_domain(value):
     value = re.sub(r"^[~*.]+", "", unquote(str(value)).strip().lower())
     parsed = urlsplit(value if "://" in value else f"//{value}", scheme="https")
     hostname = (parsed.hostname or value.split("/")[0]).split(":")[0].strip(".")
@@ -674,6 +787,11 @@ def normalize_domain(value):
 
 
 def get_url_parts(url):
+    return _cached_get_url_parts(str(url))
+
+
+@processing_lru_cache(maxsize=16384)
+def _cached_get_url_parts(url):
     raw_url = str(url).strip()
     parsed = urlsplit(raw_url if "://" in raw_url else f"https://{raw_url}")
     searchable_content = " ".join([parsed.path, parsed.query, parsed.fragment])
@@ -687,6 +805,11 @@ def domains_match(url_domain, pattern_domain):
 
 
 def normalize_coverage_basis(basis):
+    return _cached_normalize_coverage_basis(str(basis))
+
+
+@processing_lru_cache(maxsize=32768)
+def _cached_normalize_coverage_basis(basis):
     """Preserve wildcard gaps and exact ~word~ locks; ignore backslashes."""
     raw_basis = unquote(str(basis)).replace("\\", "")
     tokens = []
@@ -784,11 +907,16 @@ def coerce_metric(series):
 
 
 def read_coverage_csv(uploaded_file):
+    return _cached_coverage_csv(uploaded_file.getvalue()).copy(deep=True)
+
+
+@processing_lru_cache(maxsize=2)
+def _cached_coverage_csv(raw):
+    from io import BytesIO
     last_error = None
     for encoding in ("utf-8-sig", "utf-16", "latin-1"):
         try:
-            uploaded_file.seek(0)
-            return pd.read_csv(uploaded_file, encoding=encoding, sep=None, engine="python")
+            return pd.read_csv(BytesIO(raw), encoding=encoding, sep=None, engine="python")
         except Exception as err:
             last_error = err
     raise ValueError(f"Unable to read the CSV file: {last_error}")
@@ -824,7 +952,7 @@ def remove_report_total_rows(input_df):
 # =============================================================
 # FAST COVERAGE MATCHER
 # =============================================================
-@lru_cache(maxsize=50000)
+@processing_lru_cache(maxsize=50000)
 def _coverage_word_forms(word):
     """URL-side forms only: exact token plus common singular spellings."""
     forms = {word}
@@ -841,7 +969,7 @@ def _coverage_word_forms(word):
     return frozenset(forms)
 
 
-@lru_cache(maxsize=4)
+@processing_lru_cache(maxsize=4)
 def _coverage_basis_index(bases):
     """Index contiguous fragments; wildcard-separated fragments may reorder."""
     children = [{}]
@@ -1916,8 +2044,12 @@ def keyword_domain_key(value):
 
 
 def read_keyword_csv(uploaded):
+    return _cached_keyword_csv(uploaded.getvalue()).copy(deep=True)
+
+
+@processing_lru_cache(maxsize=2)
+def _cached_keyword_csv(raw):
     from io import BytesIO
-    raw = uploaded.getvalue()
     error = None
     for encoding in ("utf-8-sig", "utf-16", "cp1252"):
         try:
@@ -1930,6 +2062,16 @@ def read_keyword_csv(uploaded):
         except (UnicodeError, ValueError, pd.errors.ParserError) as exc:
             error = exc
     raise ValueError(f"Unable to read CSV: {error}")
+
+
+@processing_lru_cache(maxsize=2)
+def _cached_performance_csv(raw):
+    return remove_pair_report_total_rows(_cached_keyword_csv(raw))
+
+
+@processing_lru_cache(maxsize=2)
+def _cached_upload_digest(raw):
+    return hashlib.sha256(raw).hexdigest()[:16]
 
 
 def keyword_priority_lookup(database):
@@ -2088,6 +2230,11 @@ def export_promote_domain(domain, admin_name):
 
 
 def audit_text_key(value):
+    return _cached_audit_text_key(keyword_text(value))
+
+
+@processing_lru_cache(maxsize=32768)
+def _cached_audit_text_key(value):
     return re.sub(r"\s+", " ", keyword_text(value)).casefold()
 
 
@@ -2154,29 +2301,37 @@ def performance_number(series, label):
 
 
 def performance_live_index(patterns, keyword_rows):
-    """Only keyword relationships belonging to the active workbook may qualify."""
-    live, index = {}, {}
+    """Build the exact live lookup, resolving shared source metadata once."""
+    live,index,resolved = {},{},{}
     for source in patterns.to_dict("records"):
-        key = (audit_pattern_key(source.get("url_pattern")), keyword_text(source.get("language_code")).lower())
-        live.setdefault(key, []).append(source)
-    for record in keyword_rows.to_dict("records"):
-        pattern = keyword_text(record.get("source_pattern"))
-        language = keyword_text(record.get("language")).lower()
-        sources = live.get((audit_pattern_key(pattern), language), [])
-        admin = record.get("source_admin_name")
-        if admin is not None and not pd.isna(admin):
-            sources = [s for s in sources if audit_text_key(s.get("admin_name")) == audit_text_key(admin)]
-        elif ".promote" in pattern.casefold() and len({audit_text_key(s.get("admin_name")) for s in sources}) > 1:
-            sources = [dict(sources[0], admin_name="")]
-        if not sources:
-            continue
-        domain, basis = split_domain_basis(pattern)
-        for source in sources:
-            decorated, issue = export_promote_domain(domain, source.get("admin_name"))
-            mapping = dict(domain=decorated, basis=basis, keywords=keyword_text(record.get("keyword")),
-                           languagecode=language, priority=keyword_text(source.get("priority")), issue=issue)
-            for alias in {basis, pattern, domain + "*" + basis}:
-                index.setdefault((audit_pattern_key(alias), audit_text_key(record.get("keyword"))), []).append(mapping)
+        key = (audit_pattern_key(source.get("url_pattern")),keyword_text(source.get("language_code")).lower())
+        live.setdefault(key,[]).append(source)
+    fields = ["source_pattern","keyword","language","source_admin_name"]
+    for pattern_value,keyword_value,language_value,admin in keyword_rows.reindex(columns=fields).itertuples(index=False,name=None):
+        pattern,language = keyword_text(pattern_value),keyword_text(language_value).lower()
+        source_admin = None if admin is None or pd.isna(admin) else audit_text_key(admin)
+        source_key = (pattern,language,source_admin)
+        if source_key not in resolved:
+            sources = live.get((audit_pattern_key(pattern),language),[])
+            if source_admin is not None:
+                sources = [source for source in sources if audit_text_key(source.get("admin_name"))==source_admin]
+            elif ".promote" in pattern.casefold() and len({audit_text_key(source.get("admin_name")) for source in sources})>1:
+                sources = [dict(sources[0],admin_name="")]
+            domain,basis = split_domain_basis(pattern)
+            aliases = {audit_pattern_key(alias) for alias in (basis,pattern,domain+"*"+basis)}
+            templates = []
+            for source in sources:
+                decorated,issue = export_promote_domain(domain,source.get("admin_name"))
+                templates.append(dict(domain=decorated,basis=basis,languagecode=language,
+                                      priority=keyword_text(source.get("priority")),issue=issue))
+            resolved[source_key] = aliases,templates
+        aliases,templates = resolved[source_key]
+        keyword = keyword_text(keyword_value)
+        identity = audit_text_key(keyword)
+        for template in templates:
+            mapping = dict(template,keywords=keyword)
+            for alias in aliases:
+                index.setdefault((alias,identity),[]).append(mapping)
     return index
 
 
@@ -2227,7 +2382,7 @@ def performance_conditions_mask(pairs, conditions):
     return result
 
 
-def prepare_performance_review(frame, columns, patterns, keyword_rows, conditions=None):
+def prepare_performance_review(frame, columns, patterns, keyword_rows, conditions=None, live_index=None):
     conditions = conditions or performance_check_conditions()
     for field in ("basis", "keyword", "impressions", "rpm"):
         if not columns.get(field):
@@ -2237,7 +2392,7 @@ def prepare_performance_review(frame, columns, patterns, keyword_rows, condition
         raise ValueError("Each source column can be mapped to only one field.")
     source, removed = remove_pair_report_total_rows(frame, columns["basis"], columns["keyword"])
     removed += frame.attrs.get("excluded_report_rows", 0)
-    source = source.loc[~source.apply(lambda row: all(not keyword_text(v) for v in row), axis=1)].reset_index(drop=True)
+    source = source.loc[~source.apply(lambda column: column.map(keyword_text).eq("")).all(axis=1)].reset_index(drop=True)
     if source.empty:
         return pd.DataFrame(),{},dict(pairs=0,eligible=0,underperforming=0,removed=removed)
     data = pd.DataFrame(index=source.index)
@@ -2275,9 +2430,11 @@ def prepare_performance_review(frame, columns, patterns, keyword_rows, condition
         data["click_weighted_rpc"] = data["rpc"]*data["clicks"]
         aggregation["click_weighted_rpc"] = ("click_weighted_rpc","sum")
     totals = data.groupby(keys, as_index=False, sort=False).agg(**aggregation)
-    index = performance_live_index(patterns, keyword_rows)
+    index = performance_live_index(patterns,keyword_rows) if live_index is None else live_index
     eligible = []
     for pair in totals.to_dict("records"):
+        if pair["impressions"] < conditions["minimum_impressions"]:
+            continue
         matches = index.get((pair["basis_key"], pair["keyword_key"]), [])
         matches = [m for m in matches if (not pair["language"] or m["languagecode"] == pair["language"])
                    and (not pair["domain"] or keyword_domain_key(m["domain"]) == pair["domain"])]
@@ -2291,6 +2448,7 @@ def prepare_performance_review(frame, columns, patterns, keyword_rows, condition
             eligible.append(pair)
     pairs = pd.DataFrame(eligible)
     review_rows, exports = [], {}
+    source_records = source.to_dict("records") if not pairs.empty else []
     if not pairs.empty:
         for field in used_metrics:
             pairs["basis_average_"+field] = pairs.groupby(["basis_key","language","domain"])[field].transform("mean")
@@ -2298,7 +2456,7 @@ def prepare_performance_review(frame, columns, patterns, keyword_rows, condition
         for pair_id, pair in enumerate(pairs.loc[performance_conditions_mask(pairs,conditions)].to_dict("records")):
             exports[pair_id] = pair["matches"]
             for row_id in pair["source_rows"]:
-                review_rows.append({"Select for deletion": False, **source.iloc[row_id].to_dict(),
+                review_rows.append({"Select for deletion": False, **source_records[row_id],
                                     "Review: Pair impressions": pair["impressions"],
                                     "Review: Pair RPM": pair["rpm"], "Review: Basis average RPM": pair["average"],
                                     "Review: Pair ID": pair_id,
@@ -2368,11 +2526,11 @@ def performance_replacement_entries(deletion, patterns):
     return pd.DataFrame(rows,columns=["Select","domain","basis","keywords","languagecode","priority"])
 
 
-def performance_upload_sheet(edited, deletion, allowed_domains, patterns, keyword_rows):
+def performance_upload_sheet(edited, deletion, allowed_domains, patterns, keyword_rows, existing_keywords=None):
     selected = edited.loc[edited["Select"].fillna(False)].copy()
     if selected.empty:
         raise ValueError("Select at least one keyword to generate an upload sheet.")
-    existing = performance_existing_basis_keywords(keyword_rows)
+    existing = performance_existing_basis_keywords(keyword_rows) if existing_keywords is None else existing_keywords
     seen, rows = set(), []
     for position, row in enumerate(selected.to_dict("records"), 1):
         domain, basis, keyword, language = [keyword_text(row[k]) for k in ("domain", "basis", "keywords", "languagecode")]
@@ -2406,13 +2564,13 @@ def underperforming_pairs_page():
     if file is None:
         return
     try:
-        frame, removed_on_upload = remove_pair_report_total_rows(read_keyword_csv(file))
+        frame, removed_on_upload = _cached_performance_csv(file.getvalue())
         if removed_on_upload:
             st.info(f"Removed {removed_on_upload:,} summary row(s): Grand Total, Report Total or Stripped URL (Others).")
         if frame.empty:
             st.warning("The uploaded CSV contains no performance data after removing summary rows.")
             return
-        digest = hashlib.sha256(file.getvalue()).hexdigest()[:16]
+        digest = _cached_upload_digest(file.getvalue())
         columns = {}
         with st.expander("CSV column mapping", expanded=True):
             st.caption("Basis, keyword, impressions and RPM are required. Other columns are preserved exactly in the review table.")
@@ -2434,15 +2592,12 @@ def underperforming_pairs_page():
             st.caption("Examples: Keyword Clicks < Fixed Value 5; RPM < Basis Average; RPM < Basis Average % 80 (below 80% of the average). Add/remove rows to customize. Removing all rules lists all existing pairs meeting the impression threshold.")
             st.caption("Duplicates: counts and revenue are summed; RPM/L2R use impression weights. RPC uses keyword-click weights when that column is mapped, otherwise impression weights. Zero-weight groups use the mean reported rate. Percentages use the numeric scale in your CSV, e.g. enter 5 for values written as 5%.")
             conditions = performance_check_conditions(minimum_impressions,mode,rule_rows.to_dict("records"))
-        with get_connection() as conn:
-            initialize_keyword_store(conn)
-            patterns = pd.read_sql_query("SELECT url_pattern, language_code, admin_name, priority FROM url_patterns", conn)
-            keyword_rows = pd.read_sql_query("SELECT source_pattern, keyword, language, source_admin_name FROM internal_pattern_keyword_training", conn)
-        signature = hashlib.sha256((digest + json.dumps(columns, sort_keys=True) + json.dumps(conditions,sort_keys=True) + patterns.to_json() + keyword_rows.to_json()).encode()).hexdigest()
+        revision_key,patterns,keyword_rows = load_performance_snapshot()
+        signature = hashlib.sha256((digest+json.dumps(columns,sort_keys=True)+json.dumps(conditions,sort_keys=True)+repr(revision_key)).encode()).hexdigest()
         if st.button("Check Keyword Performance", type="primary", key="perf_check"):
             if keyword_rows.empty:
                 raise ValueError("Upload and confirm a shared workbook containing pattern_keywords first.")
-            review, exports, stats = prepare_performance_review(frame, columns, patterns, keyword_rows,conditions)
+            review, exports, stats = prepare_performance_review(frame,columns,patterns,keyword_rows,conditions,live_index=_cached_performance_index(revision_key))
             st.session_state["perf_manual_workflow"] = dict(signature=signature, review=review, exports=exports, stats=stats,
                                                     revision=st.session_state.get("perf_revision", 0) + 1)
             st.session_state["perf_revision"] = st.session_state["perf_manual_workflow"]["revision"]
@@ -2516,7 +2671,7 @@ def underperforming_pairs_page():
         upload_signature = hashlib.sha256((edited.to_json() + json.dumps(domains)).encode()).hexdigest()
         if st.button("Generate Upload Sheet", type="primary", key="perf_upload"):
             state.pop("upload", None)
-            state["upload"] = performance_upload_sheet(edited, deletion, domains, patterns, keyword_rows)
+            state["upload"] = performance_upload_sheet(edited,deletion,domains,patterns,keyword_rows,existing_keywords=_cached_existing_basis_keywords(revision_key))
             state["upload_signature"] = upload_signature
         if state.get("upload_signature") == upload_signature and "upload" in state:
             st.subheader("Upload Sheet")
