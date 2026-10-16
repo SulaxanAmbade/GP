@@ -323,10 +323,10 @@ def replace_shared_dataset(new_df, filename, file_date, updated_by, pattern_keyw
     prepared["admin_name"] = prepared["admin_name"].map(
         lambda value: None if pd.isna(value) or not str(value).strip() else str(value).strip()
     )
-    records = [
+    records = (
         tuple(None if pd.isna(value) else str(value) for value in row)
         for row in prepared[PATTERN_COLUMNS].itertuples(index=False, name=None)
-    ]
+    )
     conn = get_connection()
     try:
         cursor = conn.cursor()
@@ -540,22 +540,27 @@ def repair_admin_alignment(df, database_reference=None):
             repaired[column] = None
     # Pandas can convert returned None values back into float NaN. Keep the
     # working columns as strings with an empty-string missing-value sentinel.
-    ids = repaired["updated_admin_id"].map(normalize_admin_id).fillna("").astype(str)
-    names = repaired["admin_name"].map(clean_admin_value).fillna("").astype(str)
+    # Administrator values repeat across thousands of rows in typical exports.
+    normalize_id = lru_cache(maxsize=8192)(normalize_admin_id)
+    clean_name = lru_cache(maxsize=8192)(clean_admin_value)
+    base_name_for = lru_cache(maxsize=8192)(admin_lookup_base_name)
+    ids = repaired["updated_admin_id"].map(normalize_id).fillna("").astype(str)
+    names = repaired["admin_name"].map(clean_name).fillna("").astype(str)
     if database_reference is None:
         database_reference = pd.DataFrame(columns=["updated_admin_id", "admin_name"])
-    database_ids = database_reference["updated_admin_id"].map(normalize_admin_id).fillna("").astype(str)
-    database_names = database_reference["admin_name"].map(clean_admin_value).fillna("").astype(str)
+    database_ids = database_reference["updated_admin_id"].map(normalize_id).fillna("").astype(str)
+    database_names = database_reference["admin_name"].map(clean_name).fillna("").astype(str)
     known_ids = set(ids.loc[ids.ne("")]) | set(database_ids.loc[database_ids.ne("")])
     # Numeric values in admin_name are treated as misplaced administrator IDs.
+    @lru_cache(maxsize=8192)
     def is_misplaced_id(value):
-        value = clean_admin_value(value)
+        value = clean_name(value)
         return bool(value) and (
-            re.fullmatch(r"\d+", normalize_admin_id(value) or "") is not None
-            or normalize_admin_id(value) in known_ids
+            re.fullmatch(r"\d+", normalize_id(value) or "") is not None
+            or normalize_id(value) in known_ids
         )
     misplaced = names.map(is_misplaced_id).astype(bool)
-    candidate_ids = names.map(normalize_admin_id).fillna("").astype(str)
+    candidate_ids = names.map(normalize_id).fillna("").astype(str)
     recovered = misplaced & ids.eq("")
     overwritten = misplaced & ids.ne("") & candidate_ids.ne(ids)
     # The user-specified repair moves the ID even when the destination contains
@@ -565,8 +570,8 @@ def repair_admin_alignment(df, database_reference=None):
 
     def make_lookup(pair_ids, pair_names):
         candidates = {}
-        for admin_id, name in zip(pair_ids, pair_names):
-            base_name = admin_lookup_base_name(name)
+        for admin_id, name in dict.fromkeys(zip(pair_ids, pair_names)):
+            base_name = base_name_for(name)
             if admin_id and base_name and not is_misplaced_id(base_name):
                 key = base_name.casefold()
                 candidates.setdefault(admin_id, {}).setdefault(key, base_name)
@@ -2108,16 +2113,29 @@ def initialize_keyword_store(conn):
 
 
 def unpack_pattern_keywords(value):
+    # Cache only complete text cells, returning a fresh list to each caller.
+    # Nested JSON strings use the uncached parser to avoid evicting full cells.
+    if isinstance(value, str) and len(value) <= 65536:
+        return list(_cached_pattern_keyword_cell(value))
+    return _unpack_pattern_keywords(value)
+
+
+@processing_lru_cache(maxsize=4096)
+def _cached_pattern_keyword_cell(value):
+    return tuple(_unpack_pattern_keywords(value))
+
+
+def _unpack_pattern_keywords(value):
     import csv
     from html import unescape
     if isinstance(value, (list, tuple)):
-        values = [keyword for part in value for keyword in unpack_pattern_keywords(part)]
+        values = [keyword for part in value for keyword in _unpack_pattern_keywords(part)]
     elif isinstance(value, dict):
         headers = {keyword_header(key): key for key in value}
         key = next((headers[name] for name in ("keyword", "keywordterm", "keywords", "patternkeywords") if name in headers), None)
         if key is None:
             raise ValueError("Unsupported pattern_keywords JSON object. Use keyword/Keyword Term/keywords fields or a JSON list of strings.")
-        values = unpack_pattern_keywords(value[key])
+        values = _unpack_pattern_keywords(value[key])
     elif value is None or pd.isna(value):
         values = []
     else:
@@ -2150,15 +2168,16 @@ def unpack_pattern_keywords(value):
                     else:
                         raise ValueError("Malformed structured keyword value; skipped for keyword matching.")
                 else:
-                    return unpack_pattern_keywords(parsed)
+                    return _unpack_pattern_keywords(parsed)
             else:
-                return unpack_pattern_keywords(parsed)
+                return _unpack_pattern_keywords(parsed)
         text = re.sub(r"<br\s*/?>", "\n", text, flags=re.IGNORECASE)
         values = []
         for segment in re.split(r"[\n\r;|\t]+", text):
             # CSV quoting preserves commas inside a keyword.
             values.extend(next(csv.reader([segment], skipinitialspace=True)))
-    return list(dict.fromkeys(keyword_text(keyword) for keyword in values if keyword_text(keyword)))
+    cleaned = (keyword_text(keyword) for keyword in values)
+    return list(dict.fromkeys(keyword for keyword in cleaned if keyword))
 
 
 def extract_pattern_keyword_rows(df):
@@ -2167,32 +2186,44 @@ def extract_pattern_keyword_rows(df):
     if list(df.columns).count("pattern_keywords") > 1:
         raise ValueError("Duplicate pattern_keywords columns in the workbook.")
     rows, issues = {}, []
-    for position, row in enumerate(df.to_dict("records"), 1):
-        try:
-            keywords = unpack_pattern_keywords(row.get("pattern_keywords"))
-        except (ValueError, TypeError, RecursionError):
-            issues.append(position)
-            continue
-        if not keywords:
-            continue
-        pattern = keyword_text(row.get("url_pattern"))
-        language = keyword_text(row.get("language_code")).lower()
-        if not pattern or not language:
-            issues.append(position)
-            continue
+
+    @lru_cache(maxsize=4096)
+    def source_records(pattern, language, source_admin, keywords):
         if "*" in pattern.strip("*"):
             domain, basis = split_domain_basis(pattern)
         else:
             domain, basis = "", pattern.strip("*")
         if not keyword_words(basis):
-            continue  # Domain-only patterns do not establish a basis–keyword mapping.
+            return ()
+        normalized_pattern = pattern.replace("\\*", "*").strip().casefold()
+        normalized_admin = source_admin.casefold()
+        records = []
         for keyword in keywords:
-            source_admin = keyword_text(row.get("admin_name"))
-            identity = [pattern.replace("\\*", "*").strip().casefold(),language,keyword.casefold(),source_admin.casefold()]
-            key = hashlib.sha256(json.dumps(identity,ensure_ascii=False).encode("utf-8")).hexdigest()
-            rows[key] = {"pair_key": key, "domain": domain, "basis": basis,
-                         "keyword": keyword, "language": language, "source_pattern": pattern,
-                         "source_admin_name": source_admin}
+            identity = [normalized_pattern, language, keyword.casefold(), normalized_admin]
+            key = hashlib.sha256(json.dumps(identity, ensure_ascii=False).encode("utf-8")).hexdigest()
+            records.append((key, {"pair_key": key, "domain": domain, "basis": basis,
+                "keyword": keyword, "language": language, "source_pattern": pattern,
+                "source_admin_name": source_admin}))
+        return tuple(records)
+
+    columns = ["pattern_keywords", "url_pattern", "language_code", "admin_name"]
+    values = df.reindex(columns=columns).itertuples(index=False, name=None)
+    for position, (cell, raw_pattern, raw_language, raw_admin) in enumerate(values, 1):
+        try:
+            keywords = unpack_pattern_keywords(cell)
+        except (ValueError, TypeError, RecursionError):
+            issues.append(position)
+            continue
+        if not keywords:
+            continue
+        pattern = keyword_text(raw_pattern)
+        language = keyword_text(raw_language).lower()
+        if not pattern or not language:
+            issues.append(position)
+            continue
+        # Reusing records still applies updates in workbook order: when duplicate
+        # identities use different capitalization, the last occurrence wins.
+        rows.update(source_records(pattern, language, keyword_text(raw_admin), tuple(keywords)))
     df.attrs["_pattern_keyword_skipped_rows"] = issues
     return list(rows.values())
 
@@ -2206,10 +2237,10 @@ def store_pattern_keyword_rows(conn, rows, filename):
     timestamp = datetime.now().isoformat(timespec="microseconds")
     conn.executemany("""INSERT INTO internal_pattern_keyword_training
         (pair_key, domain, basis, keyword, language, source_pattern, source_filename, captured_at, source_admin_name)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""", [
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""", (
         (row["pair_key"], row["domain"], row["basis"], row["keyword"], row["language"],
          row["source_pattern"], filename, timestamp, row.get("source_admin_name")) for row in rows
-    ])
+    ))
 
 
 
