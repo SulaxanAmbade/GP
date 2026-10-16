@@ -796,6 +796,17 @@ def get_url_parts(url):
 
 
 @processing_lru_cache(maxsize=16384)
+def coverage_url_parts(url):
+    """Match the complete split basis against hostname and URL content."""
+    raw_url = str(url).strip()
+    parsed = urlsplit(raw_url if "://" in raw_url else f"https://{raw_url}")
+    searchable_content = " ".join([
+        parsed.hostname or "", parsed.path, parsed.query, parsed.fragment,
+    ])
+    return normalize_domain(parsed.hostname or ""), normalize_search_text(searchable_content)
+
+
+@processing_lru_cache(maxsize=16384)
 def _cached_get_url_parts(url):
     raw_url = str(url).strip()
     parsed = urlsplit(raw_url if "://" in raw_url else f"https://{raw_url}")
@@ -1089,18 +1100,18 @@ def create_coverage_report(input_df, basis_catalog, selected_languages=None):
     ))
     order_rank = {basis_id:rank for rank,basis_id in enumerate(match_order)}
     index = _coverage_basis_index(tuple(str(row[0]) for row in records))
-    path_matches = {}
+    url_matches = {}
     summary_rows = []
     detail_rows = []
     for url, impressions, revenue in prepared[[
         "URL", "Keyword Impressions", "Revenue",
     ]].itertuples(index=False, name=None):
-        domain, searchable_url = get_url_parts(url)
-        ids = path_matches.get(searchable_url)
+        domain, searchable_url = coverage_url_parts(url)
+        ids = url_matches.get(searchable_url)
         if ids is None:
             matches = _coverage_match_ids(searchable_url, index)
             ids = [min(matches,key=order_rank.__getitem__)] if matches else []
-            path_matches[searchable_url] = ids
+            url_matches[searchable_url] = ids
         if not ids:
             summary_rows.append((
                 url, domain, language_label, "No Matching Basis", 0,
@@ -1447,7 +1458,7 @@ def render_coverage_report(final_df):
             "Grand Total, Report Total, or Stripped URL (Others)."
         )
     catalog_signature = hashlib.sha256(
-        ("priority-single-basis-v1\n" + basis_catalog.to_csv(index=False)).encode("utf-8")
+        ("priority-full-url-basis-v2\n" + basis_catalog.to_csv(index=False)).encode("utf-8")
     ).hexdigest()
     if st.button(
         "Create Coverage Report", type="primary", use_container_width=True,
