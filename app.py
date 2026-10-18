@@ -912,6 +912,13 @@ def make_basis_catalog(pattern_df):
     return catalog.reset_index(drop=True)
 
 
+def coverage_catalog_signature(catalog):
+    """Hash every catalog row without building a full CSV string each rerun."""
+    digest = hashlib.sha256(b"coverage-summary-v3\n")
+    digest.update(pd.util.hash_pandas_object(catalog, index=False).to_numpy().tobytes())
+    return digest.hexdigest()
+
+
 def coerce_metric(series):
     cleaned = (
         series.fillna(0).astype(str).str.strip()
@@ -937,11 +944,22 @@ def _cached_coverage_csv(raw):
 
 
 def _parse_coverage_csv(raw):
+    return _read_coverage_csv_columns(raw)
+
+
+def _read_coverage_csv_columns(raw, nrows=None, usecols=None):
     from io import BytesIO
+    import csv
     last_error = None
     for encoding in ("utf-8-sig", "utf-16", "latin-1"):
         try:
-            return pd.read_csv(BytesIO(raw), encoding=encoding, sep=None, engine="python")
+            try:
+                sample = raw[:65536].decode(encoding, errors="replace")
+                separator = csv.Sniffer().sniff(sample, delimiters=",;\t|").delimiter
+            except csv.Error:
+                separator = None
+            return pd.read_csv(BytesIO(raw), encoding=encoding, sep=separator,
+                engine="c" if separator is not None else "python", nrows=nrows, usecols=usecols)
         except Exception as err:
             last_error = err
     raise ValueError(f"Unable to read the CSV file: {last_error}")
@@ -1000,18 +1018,17 @@ def _coverage_basis_index(bases):
     children = [None]
     terminals = {}
     fragment_ids = {}
-    watchers = []
-    condition_counts = []
+    requirements = []
+    frequency = Counter()
     for basis_id, basis in enumerate(bases):
         fragments = [tuple(part.split()) for part in basis.split("*") if part.strip()]
         required = Counter(fragments)
-        condition_counts.append(len(required))
+        basis_requirements = []
         for fragment, occurrences in required.items():
             fragment_id = fragment_ids.get(fragment)
             if fragment_id is None:
                 fragment_id = len(fragment_ids)
                 fragment_ids[fragment] = fragment_id
-                watchers.append({})
                 node = 0
                 for word in fragment:
                     edges = children[node]
@@ -1024,16 +1041,23 @@ def _coverage_basis_index(bases):
                         children.append(None)
                     node = child
                 terminals.setdefault(node, []).append(fragment_id)
-            watchers[fragment_id].setdefault(occurrences, []).append(basis_id)
-    return children, terminals, watchers, condition_counts
+            basis_requirements.append((fragment_id, occurrences))
+            frequency[fragment_id] += 1
+        requirements.append(tuple(basis_requirements))
+    # A common word such as "health" must not touch every basis for every URL.
+    # Only the rarest required fragment nominates a basis for verification.
+    anchors = {}
+    for basis_id, required in enumerate(requirements):
+        if required:
+            fragment_id, count = min(required, key=lambda item: frequency[item[0]])
+            anchors.setdefault(fragment_id, {}).setdefault(count, []).append(basis_id)
+    return children, terminals, anchors, requirements
 
 
-def _coverage_match_ids(searchable_url, index):
-    children, terminals, watchers, condition_counts = index
+def _coverage_match_ids(searchable_url, index, order_rank=None):
+    children, terminals, anchors, requirements = index
     active = set()
     occurrences = Counter()
-    satisfied = Counter()
-    matches = set()
     for word in searchable_url.split():
         forms = _coverage_word_forms(word)
         locked_word = f"~{word}~"
@@ -1055,12 +1079,24 @@ def _coverage_match_ids(searchable_url, index):
         }
         for fragment_id in found_fragments:
             occurrences[fragment_id] += 1
-            for basis_id in watchers[fragment_id].get(occurrences[fragment_id], ()):
-                satisfied[basis_id] += 1
-                if satisfied[basis_id] == condition_counts[basis_id]:
-                    matches.add(basis_id)
         active = next_active
-    return tuple(sorted(matches))
+    matches = []
+    best = None
+    for fragment_id, count in occurrences.items():
+        for required_count, candidates in anchors.get(fragment_id, {}).items():
+            if count < required_count:
+                continue
+            for basis_id in candidates:
+                if order_rank is not None and best is not None and order_rank[basis_id] >= order_rank[best]:
+                    continue
+                if all(occurrences.get(fragment, 0) >= needed for fragment, needed in requirements[basis_id]):
+                    if order_rank is None:
+                        matches.append(basis_id)
+                    else:
+                        best = basis_id
+                        if order_rank[best] == 0:
+                            return (best,)
+    return tuple(sorted(matches)) if order_rank is None else (() if best is None else (best,))
 
 
 def create_coverage_report(input_df, basis_catalog, selected_languages=None):
@@ -1119,8 +1155,7 @@ def create_coverage_report(input_df, basis_catalog, selected_languages=None):
         domain, searchable_url = coverage_url_parts(url)
         # URLs are already grouped above. Keeping all normalized URLs again
         # doubles their storage and gives almost no reuse with host matching.
-        matches = _coverage_match_ids(searchable_url, index)
-        ids = [min(matches,key=order_rank.__getitem__)] if matches else []
+        ids = _coverage_match_ids(searchable_url, index, order_rank)
         if not ids:
             summary_rows.append((
                 url, domain, language_label, "No Matching Basis", 0,
@@ -1148,27 +1183,9 @@ def create_coverage_report(input_df, basis_catalog, selected_languages=None):
         ))
     url_summary_df = pd.DataFrame(summary_rows, columns=summary_columns)
     detail_df = pd.DataFrame(detail_rows, columns=detail_columns)
-    coverage_pivot = url_summary_df.groupby(
-        ["Language Code", "Coverage Status"], as_index=False, dropna=False,
-    ).agg(**{
-        "URLs": ("URL", "count"),
-        "Keyword Impressions": ("Keyword Impressions", "sum"),
-        "Revenue": ("Revenue", "sum"),
-    })
-    covered_detail = detail_df.loc[detail_df["Coverage Status"].eq("Covered")]
-    if covered_detail.empty:
-        basis_pivot = pd.DataFrame(columns=basis_columns)
-    else:
-        basis_pivot = covered_detail.groupby(
-            ["Language Code", "URL Domain", "Matching Basis"],
-            as_index=False, dropna=False,
-        ).agg(**{
-            "URLs": ("URL", "nunique"),
-            "Keyword Impressions": ("Keyword Impressions", "sum"),
-            "Revenue": ("Revenue", "sum"),
-        }).sort_values(
-            ["Revenue", "Keyword Impressions", "URLs"], ascending=False,
-        )
+    # Keep tuple compatibility without building reports no longer used by the UI.
+    coverage_pivot = pd.DataFrame(columns=coverage_columns)
+    basis_pivot = pd.DataFrame(columns=basis_columns)
     return url_summary_df, detail_df, coverage_pivot, basis_pivot
 
 
@@ -1182,6 +1199,8 @@ def add_user_coverage_bases(basis_catalog, edited_rows, selected_languages):
         raise ValueError("Use the basis catalog for the report's selected languages.")
     if "Language Code" not in edited_rows.columns:
         raise ValueError("The new-basis table must include a Language Code column.")
+    if edited_rows.empty or not edited_rows["New Basis"].fillna("").astype(str).str.strip().ne("").any():
+        return basis_catalog, pd.DataFrame(columns=basis_catalog.columns), []
     existing = set(zip(basis_catalog["language_code"], basis_catalog["normalized_basis"]))
     edited_rows = edited_rows.copy()
     if "Priority" not in edited_rows.columns:
@@ -1288,76 +1307,39 @@ def coverage_exclude_bases(catalog, choices):
     excluded = {(str(language).strip().lower(), normalize_coverage_basis(basis))
                 for exclude,basis,language in choices[["Exclude","Basis","Language Code"]].itertuples(index=False,name=None)
                 if pd.notna(exclude) and bool(exclude)}
+    if not excluded:
+        return catalog, []
     keep = [(str(language).strip().lower(),str(basis)) not in excluded
             for language,basis in catalog[["language_code","normalized_basis"]].itertuples(index=False,name=None)]
     return catalog.loc[keep].copy(), sorted(excluded)
 
 
 def render_coverage_results(report, title, key_prefix):
-    """Show url_summary_df directly, with optional aggregate and match details."""
-    url_summary_df, detail_df, coverage_pivot, basis_pivot = report
+    """Render only the requested summary and prepare its CSV on demand."""
+    summary = report[0]
     st.subheader(title)
-    total_urls = len(url_summary_df)
-    covered_urls = int(url_summary_df["Coverage Status"].eq("Covered").sum())
-    metric1, metric2, metric3, metric4 = st.columns(4)
-    metric1.metric("URLs Checked", f"{total_urls:,}")
-    metric2.metric("Covered URLs", f"{covered_urls:,}")
-    metric3.metric("No Matching Basis", f"{total_urls - covered_urls:,}")
-    metric4.metric("Coverage Rate", f"{covered_urls / total_urls * 100 if total_urls else 0:.1f}%")
-    preview_limit = 2000
-    large_report = len(url_summary_df) > 10000
-    if len(url_summary_df) > preview_limit:
-        st.caption(f"Showing the first {preview_limit:,} of {len(url_summary_df):,} URLs. CSV downloads contain every row.")
-    st.dataframe(url_summary_df.head(preview_limit), use_container_width=True, hide_index=True)
-    if not large_report:
-        st.download_button(
-            "Download Priority URL Summary", data=url_summary_df.to_csv(index=False),
-            file_name=f"{key_prefix}_priority_url_summary.csv", mime="text/csv",
-            use_container_width=True, key=f"{key_prefix}_download_summary",
-        )
-    with st.expander("Coverage Summary, Basis Performance, and Match Details", expanded=False):
-        summary_tab, basis_tab, detail_tab = st.tabs([
-            "Coverage Summary", "Basis Performance", "Match Details",
-        ])
-        with summary_tab:
-            st.dataframe(coverage_pivot, use_container_width=True, hide_index=True)
-        with basis_tab:
-            st.dataframe(basis_pivot.head(preview_limit), use_container_width=True, hide_index=True)
-            st.caption(
-                "Each URL's performance is attributed only to its selected basis. "
-                "The lowest numeric priority wins; equal priorities prefer the longer basis."
-            )
-        with detail_tab:
-            st.dataframe(detail_df.head(preview_limit), use_container_width=True, hide_index=True)
-            if len(detail_df) > preview_limit:
-                st.caption(f"Preview limited to {preview_limit:,} rows. Download the CSV for all match details.")
-        if not large_report:
-            download1, download2 = st.columns(2)
-            download1.download_button(
-                "Download Basis Report", data=basis_pivot.to_csv(index=False),
-                file_name=f"{key_prefix}_basis_report.csv", mime="text/csv",
-                use_container_width=True, key=f"{key_prefix}_download_basis",
-            )
-            download2.download_button(
-                "Download Match Details", data=detail_df.to_csv(index=False),
-                file_name=f"{key_prefix}_match_details.csv", mime="text/csv",
-                use_container_width=True, key=f"{key_prefix}_download_details",
-            )
-    if large_report:
-        exports = {
-            "Priority URL Summary": (url_summary_df, "priority_url_summary"),
-            "Basis Report": (basis_pivot, "basis_report"),
-            "Match Details": (detail_df, "match_details"),
-        }
-        st.caption("Choose one full CSV to prepare. Large reports prepare one download at a time to conserve memory.")
-        choice = st.selectbox("Prepare CSV download", ["Choose a report"] + list(exports), key=f"{key_prefix}_export_choice")
-        if choice in exports:
-            frame, suffix = exports[choice]
-            st.download_button(
-                f"Download {choice}", data=frame.to_csv(index=False),
-                file_name=f"{key_prefix}_{suffix}.csv", mime="text/csv",
-                key=f"{key_prefix}_large_download",
-            )
+    count = len(summary)
+    covered = int(summary["Coverage Status"].eq("Covered").sum())
+    columns = st.columns(4)
+    columns[0].metric("URLs Checked", f"{count:,}")
+    columns[1].metric("Covered URLs", f"{covered:,}")
+    columns[2].metric("No Matching Basis", f"{count - covered:,}")
+    columns[3].metric("Coverage Rate", f"{covered / count * 100 if count else 0:.1f}%")
+    st.dataframe(summary.head(1000), use_container_width=True, hide_index=True)
+    if count > 1000:
+        st.caption(f"Showing the first 1,000 of {count:,} URLs. The CSV includes every row.")
+    label = "URL Summary" if key_prefix == "coverage_original" else "Priority URL Summary"
+    suffix = "url_summary" if key_prefix == "coverage_original" else "priority_url_summary"
+    export_key = (key_prefix, st.session_state.get("coverage_report_revision", 0))
+    if st.button(f"Prepare {label} CSV", key=f"{key_prefix}_prepare_csv"):
+        # Retain only one prepared CSV, shared by the two summary panels.
+        st.session_state.pop("coverage_export_payload", None)
+        with st.spinner("Preparing CSV..."):
+            st.session_state["coverage_export_payload"] = (export_key, summary.to_csv(index=False).encode("utf-8-sig"))
+    saved = st.session_state.get("coverage_export_payload")
+    if saved is not None and saved[0] == export_key:
+        st.download_button(f"Download {label}", data=saved[1], file_name=f"{suffix}.csv",
+            mime="text/csv", key=f"{key_prefix}_download_summary")
 
 
 def clear_coverage_reports():
@@ -1367,7 +1349,7 @@ def clear_coverage_reports():
     for key in (
         "coverage_report", "coverage_report_language", "coverage_report_languages", "coverage_report_input",
         "coverage_report_catalog_signature", "coverage_recheck_report",
-        "coverage_recheck_signature",
+        "coverage_recheck_signature", "coverage_export_payload", "coverage_caught_choices",
     ):
         st.session_state.pop(key, None)
 
@@ -1438,11 +1420,18 @@ def render_coverage_report(final_df):
         )
         if performance_file is not None:
             try:
-                source_df = read_coverage_csv(performance_file)
-                if source_df.empty:
+                raw_csv = performance_file.getvalue()
+                upload_digest = hashlib.sha256(raw_csv).hexdigest()
+                source_info = st.session_state.get("coverage_source_info")
+                if source_info is None or source_info[0] != upload_digest:
+                    headers = list(_read_coverage_csv_columns(raw_csv, nrows=0).columns)
+                    source_info = (upload_digest, headers)
+                    st.session_state["coverage_source_info"] = source_info
+                    st.session_state.pop("coverage_prepared_upload", None)
+                if not source_info[1]:
                     st.warning("The uploaded CSV has no data rows.")
                 else:
-                    columns = list(source_df.columns)
+                    columns = source_info[1]
                     suggested_url = find_suggested_column(columns, ["url", "urls", "page url", "page"])
                     suggested_impressions = find_suggested_column(
                         columns, ["keyword impressions", "impressions", "keyword_impressions"],
@@ -1468,31 +1457,43 @@ def render_coverage_report(final_df):
                             index=optional_columns.index(suggested_revenue) if suggested_revenue in columns else 0,
                             key="coverage_revenue_column",
                         )
-                    prepared_input = pd.DataFrame({"URL": source_df[url_column]})
-                    prepared_input["Keyword Impressions"] = (
-                        coerce_metric(source_df[impressions_column]) if impressions_column != "None" else 0
-                    )
-                    prepared_input["Revenue"] = (
-                        coerce_metric(source_df[revenue_column]) if revenue_column != "None" else 0.0
-                    )
-                    prepared_input = prepared_input.loc[
-                        prepared_input["URL"].notna()
-                        & prepared_input["URL"].astype(str).str.strip().ne("")
-                    ].copy()
-                    del source_df
+                    input_key = (upload_digest, url_column, impressions_column, revenue_column)
+                    saved_input = st.session_state.get("coverage_prepared_upload")
+                    if saved_input is None or saved_input[0] != input_key:
+                        wanted = list(dict.fromkeys([url_column] + [column for column in
+                            (impressions_column, revenue_column) if column != "None"]))
+                        source_df = _read_coverage_csv_columns(raw_csv, usecols=wanted)
+                        prepared_input = pd.DataFrame({"URL": source_df[url_column]})
+                        prepared_input["Keyword Impressions"] = (
+                            coerce_metric(source_df[impressions_column]) if impressions_column != "None" else 0
+                        )
+                        prepared_input["Revenue"] = (
+                            coerce_metric(source_df[revenue_column]) if revenue_column != "None" else 0.0
+                        )
+                        prepared_input = prepared_input.loc[
+                            prepared_input["URL"].notna()
+                            & prepared_input["URL"].astype(str).str.strip().ne("")
+                        ].copy()
+                        prepared_input, removed = remove_report_total_rows(prepared_input)
+                        prepared_input.attrs["removed_total_rows"] = removed
+                        st.session_state["coverage_prepared_upload"] = (input_key, prepared_input)
+                        del source_df
+                    else:
+                        prepared_input = saved_input[1]
             except Exception as err:
                 st.error(f"Could not read the CSV: {err}")
     removed_total_rows = 0
     if prepared_input is not None:
-        prepared_input, removed_total_rows = remove_report_total_rows(prepared_input)
+        if "removed_total_rows" in prepared_input.attrs:
+            removed_total_rows = prepared_input.attrs["removed_total_rows"]
+        else:
+            prepared_input, removed_total_rows = remove_report_total_rows(prepared_input)
     if removed_total_rows:
         st.info(
             f"Removed {removed_total_rows:,} summary row(s): "
             "Grand Total, Report Total, or Stripped URL (Others)."
         )
-    catalog_signature = hashlib.sha256(
-        ("priority-full-url-basis-v2\n" + basis_catalog.to_csv(index=False)).encode("utf-8")
-    ).hexdigest()
+    catalog_signature = coverage_catalog_signature(basis_catalog)
     if st.button(
         "Create Coverage Report", type="primary", use_container_width=True,
         disabled=prepared_input is None or prepared_input.empty,
@@ -1519,7 +1520,7 @@ def render_coverage_report(final_df):
         st.info("Create a new coverage report for the selected languages and current dataset.")
         return
 
-    render_coverage_results(report, "Priority URL Summary — Existing Bases", "coverage_original")
+    render_coverage_results(report, "URL Summary — Existing Bases", "coverage_original")
     url_summary_df = report[0]
     uncovered = url_summary_df.loc[
         url_summary_df["Coverage Status"].eq("No Matching Basis"), ["URL"]
@@ -1528,12 +1529,14 @@ def render_coverage_report(final_df):
     st.subheader("Second Coverage Check")
     st.caption("Exclude caught bases to see which remaining basis catches next by priority. Exclusions apply only to this second report and to the listed language; the shared database and first report remain unchanged.")
     revision = st.session_state.get("coverage_report_revision", 0)
-    caught_choices = coverage_caught_basis_choices(report)
+    if "coverage_caught_choices" not in st.session_state:
+        st.session_state["coverage_caught_choices"] = coverage_caught_basis_choices(report)
+    caught_choices = st.session_state["coverage_caught_choices"].copy()
     if not caught_choices.empty:
         selection_key = f"coverage_excluded_basis_keys_{revision}"
         selected = set(tuple(pair) for pair in st.session_state.get(selection_key,[]))
-        caught_choices["Exclude"] = [(str(row["Language Code"]).lower(),normalize_coverage_basis(row["Basis"])) in selected
-                                     for row in caught_choices.to_dict("records")]
+        caught_choices["Exclude"] = [(str(language).lower(), normalize_coverage_basis(basis)) in selected
+            for basis, language in caught_choices[["Basis", "Language Code"]].itertuples(index=False, name=None)]
         search = st.text_input("Search Caught Bases",placeholder="Example: heart health or blood*sugar",key=f"coverage_exclusion_search_{revision}")
         visible = coverage_filter_caught_bases(caught_choices,search)
         if len(visible) > 2000:
@@ -1551,8 +1554,9 @@ def render_coverage_report(final_df):
                 column_config={"Exclude":st.column_config.CheckboxColumn("Exclude",help="Skip this basis and language in the second coverage check.")},
             )
             excluded_choices = coverage_merge_exclusion_choices(caught_choices,edited_visible)
-        st.session_state[selection_key] = [(str(row["Language Code"]).lower(),normalize_coverage_basis(row["Basis"]))
-                                          for row in excluded_choices.to_dict("records") if row["Exclude"]]
+        st.session_state[selection_key] = [(str(language).lower(), normalize_coverage_basis(basis))
+            for basis, language in excluded_choices.loc[excluded_choices["Exclude"],
+                ["Basis", "Language Code"]].itertuples(index=False, name=None)]
         st.caption(f"Showing {len(visible):,} of {len(caught_choices):,} caught basis/language pairs. {int(excluded_choices['Exclude'].sum()):,} excluded in total, including selections outside this search.")
     else:
         excluded_choices = caught_choices
@@ -1611,7 +1615,8 @@ def render_coverage_report(final_df):
     )
     remaining_catalog, excluded_keys = coverage_exclude_bases(combined_catalog,excluded_choices)
     st.caption(f"{len(excluded_keys):,} caught basis/language pair(s) excluded from the second check.")
-    additions_signature = (edited_rows[["URL", "New Basis", "Language Code", "Priority"]].to_csv(index=False)
+    changed_rows = edited_rows.loc[edited_rows["New Basis"].fillna("").astype(str).str.strip().ne("")]
+    additions_signature = (changed_rows[["URL", "New Basis", "Language Code", "Priority"]].to_csv(index=False)
                            + json.dumps(excluded_keys,ensure_ascii=False))
     if st.button(
         "Run Second Coverage Check", type="primary",
@@ -1620,6 +1625,7 @@ def render_coverage_report(final_df):
     ):
         with st.spinner("Checking coverage with exclusions and new bases..."):
             st.session_state.pop("coverage_recheck_report", None)
+            st.session_state.pop("coverage_export_payload", None)
             st.session_state["coverage_recheck_report"] = create_coverage_report(
                 st.session_state["coverage_report_input"], remaining_catalog, selected_languages=selected_languages,
             )
@@ -1637,11 +1643,7 @@ def render_coverage_report(final_df):
     render_coverage_results(
         revised_report, "Priority URL Summary — Second Coverage Check", "coverage_rechecked",
     )
-    st.download_button(
-        "Download New Bases", data=additions[["basis", "language_code", "priority"]].to_csv(index=False),
-        file_name="coverage_new_bases.csv", mime="text/csv", use_container_width=True,
-        key="coverage_download_new_bases",
-    )
+
 
 
 # =============================================================
