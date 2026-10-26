@@ -919,6 +919,19 @@ def coverage_catalog_signature(catalog):
     return digest.hexdigest()
 
 
+def uppercase_language_codes(frame):
+    """Uppercase visible/exported codes without changing database lookup keys."""
+    columns = [column for column in frame.columns
+        if re.sub(r"[^a-z]", "", str(column).casefold()) in
+        {"language", "languagecode", "kbbselectedlanguage"}]
+    if not columns:
+        return frame
+    result = frame.copy(deep=False)
+    for column in columns:
+        result[column] = frame[column].map(lambda value: value if pd.isna(value) else str(value).strip().upper())
+    return result
+
+
 def coerce_metric(series):
     cleaned = (
         series.fillna(0).astype(str).str.strip()
@@ -1186,7 +1199,7 @@ def create_coverage_report(input_df, basis_catalog, selected_languages=None):
     # Keep tuple compatibility without building reports no longer used by the UI.
     coverage_pivot = pd.DataFrame(columns=coverage_columns)
     basis_pivot = pd.DataFrame(columns=basis_columns)
-    return url_summary_df, detail_df, coverage_pivot, basis_pivot
+    return uppercase_language_codes(url_summary_df), uppercase_language_codes(detail_df), coverage_pivot, basis_pivot
 
 
 def add_user_coverage_bases(basis_catalog, edited_rows, selected_languages):
@@ -1316,7 +1329,7 @@ def coverage_exclude_bases(catalog, choices):
 
 def render_coverage_results(report, title, key_prefix):
     """Render only the requested summary and prepare its CSV on demand."""
-    summary = report[0]
+    summary = uppercase_language_codes(report[0])
     st.subheader(title)
     count = len(summary)
     covered = int(summary["Coverage Status"].eq("Covered").sum())
@@ -1330,7 +1343,7 @@ def render_coverage_results(report, title, key_prefix):
         st.caption(f"Showing the first 1,000 of {count:,} URLs. The CSV includes every row.")
     label = "URL Summary" if key_prefix == "coverage_original" else "Priority URL Summary"
     suffix = "url_summary" if key_prefix == "coverage_original" else "priority_url_summary"
-    export_key = (key_prefix, st.session_state.get("coverage_report_revision", 0))
+    export_key = (key_prefix, st.session_state.get("coverage_report_revision", 0), "uppercase-language-v1")
     if st.button(f"Prepare {label} CSV", key=f"{key_prefix}_prepare_csv"):
         # Retain only one prepared CSV, shared by the two summary panels.
         st.session_state.pop("coverage_export_payload", None)
@@ -1569,7 +1582,7 @@ def render_coverage_report(final_df):
         st.caption("New bases are used for this coverage check and do not update the shared dataset.")
     editor_input = uncovered.assign(**{
         "New Basis": "",
-        "Language Code": selected_languages[0] if len(selected_languages) == 1 else "",
+        "Language Code": selected_languages[0].upper() if len(selected_languages) == 1 else "",
         "Priority": pd.Series(pd.NA,index=uncovered.index,dtype="Int64"),
     })
     if editor_input.empty:
@@ -1595,7 +1608,7 @@ def render_coverage_report(final_df):
                 "New Basis": st.column_config.TextColumn("New Basis",width="large",help="Example: bug*bite; heart*health"),
                 "Priority": st.column_config.NumberColumn("Priority",min_value=0,step=1,help="Optional. Lower numbers catch first, e.g. 1000 before 2000. Blank catches last."),
                 "Language Code": st.column_config.SelectboxColumn(
-                    "Language Code",options=[""]+list(selected_languages),width="small",
+                    "Language Code",options=[""]+[language.upper() for language in selected_languages],width="small",
                     help="Choose one of the language codes selected at the top.",
                 ),
             },
@@ -1851,7 +1864,7 @@ def render_pending_dataset():
             "Their URL pattern rows are still included in the shared dataset."
         )
     st.write("**First 100 rows:**")
-    st.dataframe(pending_df.head(100).fillna(""), use_container_width=True, hide_index=True)
+    st.dataframe(uppercase_language_codes(pending_df.head(100)).fillna(""), use_container_width=True, hide_index=True)
     admin_repairs = st.session_state.get("pending_admin_repairs", {})
     if admin_repairs:
         st.info(
@@ -1876,7 +1889,7 @@ def render_pending_dataset():
                 f"{admin_repairs['unresolved_rows']:,} input row(s) still have no resolved admin name. "
                 "Names cannot be inferred without a unique valid ID/name pair."
             )
-            unresolved = pending_df.loc[pending_df["admin_name"].isna()]
+            unresolved = uppercase_language_codes(pending_df.loc[pending_df["admin_name"].isna()])
             with st.expander("Review Rows With Unresolved Admin Names", expanded=False):
                 st.dataframe(unresolved.fillna(""), use_container_width=True, hide_index=True)
                 st.download_button(
@@ -2002,6 +2015,7 @@ def render_dataset_search(final_df):
     search_results, search_terms = search_dataset(
         final_df, search_string, search_mode, selected_admin,
     )
+    search_results = uppercase_language_codes(search_results)
     if search_results.empty:
         st.warning("No matching rows were found for the selected admin and search criteria.")
         return
@@ -2050,7 +2064,7 @@ def render_dataset_search(final_df):
 # =============================================================
 def global_pattern_dashboard_page():
     metadata = get_dataset_metadata()
-    final_df = load_shared_dataset()
+    final_df = uppercase_language_codes(load_shared_dataset())
     st.subheader("Current Shared Dataset")
     if metadata is None:
         st.warning("No dataset has been uploaded yet.")
@@ -2573,6 +2587,8 @@ def prepare_performance_review(frame, columns, patterns, keyword_rows, condition
         display_columns = ["Select for deletion", columns["basis"], columns["keyword"],
                            "Review: Basis average RPM", "Review: Pair RPM"]
         review = review[display_columns + [c for c in review.columns if c not in display_columns]]
+    if not review.empty and columns.get("language"):
+        review[columns["language"]] = review[columns["language"]].map(lambda value: keyword_text(value).upper())
     return review, exports, {"pairs": len(totals), "eligible": len(pairs), "underperforming": len(exports), "removed": removed}
 
 
@@ -2584,7 +2600,7 @@ def performance_deletion_sheet(selected_ids, exports):
                 issues.append({k: mapping[k] for k in ("domain", "basis", "languagecode", "issue")})
             else:
                 rows.append({k: mapping[k] for k in ("domain", "basis", "keywords", "languagecode")})
-    return pd.DataFrame(rows, columns=["domain", "basis", "keywords", "languagecode"]).drop_duplicates().reset_index(drop=True), issues
+    return uppercase_language_codes(pd.DataFrame(rows, columns=["domain", "basis", "keywords", "languagecode"])).drop_duplicates().reset_index(drop=True), issues
 
 
 def performance_existing_basis_keywords(keyword_rows):
@@ -2608,7 +2624,7 @@ def performance_replacement_entries(deletion, patterns):
     rows = []
     priorities = keyword_priority_lookup(patterns)
     for (domain,basis,language),group in deletion.groupby(["domain","basis","languagecode"],sort=False):
-        saved = priorities.get((keyword_domain_key(domain),keyword_basis_key(basis),language),set())
+        saved = priorities.get((keyword_domain_key(domain),keyword_basis_key(basis),keyword_text(language).lower()),set())
         priority = keyword_default_priority(domain,basis)
         if len(saved)==1:
             try:
@@ -2619,7 +2635,7 @@ def performance_replacement_entries(deletion, patterns):
                 pass
         for slot in range(len(group)):
             rows.append({"Select":False,"domain":domain,"basis":basis,"keywords":"",
-                         "languagecode":language,"priority":priority})
+                         "languagecode":keyword_text(language).upper(),"priority":priority})
     return pd.DataFrame(rows,columns=["Select","domain","basis","keywords","languagecode","priority"])
 
 
@@ -2637,7 +2653,7 @@ def performance_upload_sheet(edited, deletion, allowed_domains, patterns, keywor
         if domain not in allowed_domains:
             raise ValueError(f"Replacement row {position}: choose an available domain.")
         prefix = "patternkeywords.global."
-        if domain.startswith(prefix) and not domain.startswith(prefix + "promote.") and domain != prefix + language:
+        if domain.lower().startswith(prefix) and not domain.lower().startswith(prefix + "promote.") and domain.lower() != prefix + language:
             raise ValueError(f"Replacement row {position}: language-specific domain must match languagecode.")
         try:
             priority = Decimal(keyword_text(row["priority"]))
@@ -2649,8 +2665,37 @@ def performance_upload_sheet(edited, deletion, allowed_domains, patterns, keywor
         if key in seen or key[2] in existing.get(key[:2], set()):
             raise ValueError(f"Replacement row {position}: this keyword is already present under the same basis/language, or repeats another selected replacement, regardless of domain.")
         seen.add(key)
-        rows.append(dict(domain=domain, basis=basis, keywords=keyword, languagecode=language, rank=1, priority=int(priority)))
+        rows.append(dict(domain=domain, basis=basis, keywords=keyword, languagecode=language.upper(), rank=1, priority=int(priority)))
     return pd.DataFrame(rows)
+
+
+def performance_replacement_check(edited, existing_keywords):
+    """Check entered rows against the shared basis/language keyword lookup."""
+    entered = []
+    for position, row in enumerate(edited.to_dict("records"), 1):
+        basis, keyword, language = (keyword_text(row.get(column)) for column in
+            ("basis", "keywords", "languagecode"))
+        selected = row.get("Select", False)
+        selected = False if pd.isna(selected) else bool(selected)
+        key = (audit_pattern_key(basis), language.lower(), audit_text_key(keyword))
+        entered.append((position, row, basis, keyword, language, selected, key))
+    counts = Counter(key for _, _, basis, keyword, language, selected, key in entered
+        if selected and basis and keyword and language)
+    results = []
+    for position, row, basis, keyword, language, selected, key in entered:
+        if not basis or not keyword or not re.fullmatch(r"[a-z]{2,3}(?:-[a-z0-9]{2,8})*", language.lower()):
+            status = "Incomplete"
+        elif key[2] in existing_keywords.get(key[:2], set()):
+            status = "Already Present"
+        elif selected and counts[key] > 1:
+            status = "Duplicate Replacement"
+        else:
+            status = "Not Present"
+        results.append({"Replacement Row": position, "Selected": selected,
+            "domain": keyword_text(row.get("domain")), "basis": basis,
+            "keywords": keyword, "languagecode": language.upper(), "Keyword Check": status})
+    return pd.DataFrame(results, columns=["Replacement Row", "Selected", "domain", "basis",
+        "keywords", "languagecode", "Keyword Check"])
 
 
 def underperforming_pairs_page():
@@ -2720,16 +2765,16 @@ def underperforming_pairs_page():
         if st.button("Generate Deletion Sheet", type="primary", disabled=not selected_ids, key="perf_delete"):
             deletion, issues = performance_deletion_sheet(selected_ids, state["exports"])
             state.update(deletion=deletion, issues=issues, selected_ids=selected_ids)
-            for key in ("replacement_entries", "upload", "replacement_latest", "editor_baseline", "editor_sig"):
+            for key in ("replacement_entries", "upload", "replacement_latest", "editor_baseline", "editor_sig", "replacement_check", "replacement_check_signature"):
                 state.pop(key, None)
             state["replacement_revision"] = state.get("replacement_revision", 0) + 1
         if "deletion" not in state or state["selected_ids"] != selected_ids:
             return
         if state["issues"]:
             st.error("Some selected mappings have an unresolved promote set ID. Correct the shared data before generating a complete deletion sheet.")
-            st.dataframe(pd.DataFrame(state["issues"]), hide_index=True)
+            st.dataframe(uppercase_language_codes(pd.DataFrame(state["issues"])), hide_index=True)
             return
-        deletion = state["deletion"]
+        deletion = uppercase_language_codes(state["deletion"])
         st.subheader("Deletion Sheet")
         st.dataframe(deletion, hide_index=True, use_container_width=True)
         st.download_button("Download Deletion Sheet", deletion.to_csv(index=False).encode("utf-8-sig"), "keyword_deletion.csv", "text/csv")
@@ -2741,17 +2786,18 @@ def underperforming_pairs_page():
         language_input = st.text_input("Additional language codes (comma separated)", key="perf_add_languages")
         set_id = st.text_input("Promote set ID (required to offer a promote domain)", key="perf_set_id").strip()
         partner = st.selectbox("Partner ID", ["8PRVCXX19", "7PRFT79UO"], key="perf_partner")
-        languages = sorted(set(deletion["languagecode"]) | {v.strip().lower() for v in language_input.split(",") if v.strip()})
-        languages = [v for v in languages if re.fullmatch(r"[a-z]{2,3}(?:-[a-z0-9]{2,8})*", v)]
-        domains = ["patternkeywords.global"] + [f"patternkeywords.global.{v}" for v in languages] + [f"{partner}.partner"]
+        languages = sorted({keyword_text(v).upper() for v in deletion["languagecode"]}
+            | {v.strip().upper() for v in language_input.split(",") if v.strip()})
+        languages = [v for v in languages if re.fullmatch(r"[A-Z]{2,3}(?:-[A-Z0-9]{2,8})*", v)]
+        domains = ["patternkeywords.global"] + [f"patternkeywords.global.{v.lower()}" for v in languages] + [f"{partner}.partner"]
         if set_id:
             if re.fullmatch(r"[0-9]+", set_id):
                 domains.append(f"patternkeywords.global.promote.{set_id}.setid")
             else:
                 st.warning("Set ID must contain digits only.")
-        editor_sig = hashlib.sha256(json.dumps(domains).encode()).hexdigest()[:12]
+        editor_sig = hashlib.sha256(("uppercase-language-v1" + json.dumps(domains)).encode()).hexdigest()[:12]
         if state.get("editor_sig") != editor_sig:
-            entries = state.get("replacement_latest", state["replacement_entries"]).copy()
+            entries = uppercase_language_codes(state.get("replacement_latest", state["replacement_entries"])).copy()
             entries.loc[~entries["domain"].isin(domains), "domain"] = "patternkeywords.global"
             state["editor_baseline"] = entries
             state["editor_sig"] = editor_sig
@@ -2766,7 +2812,27 @@ def underperforming_pairs_page():
         # Preserve edits across domain-option changes without reusing a changed editor baseline.
         st.caption("Select any number of keywords; add or remove rows as needed. Choose a domain and priority for each replacement. Language-specific domains must match languagecode. Promote domains use the set ID entered above.")
         upload_signature = hashlib.sha256((edited.to_json() + json.dumps(domains)).encode()).hexdigest()
-        if st.button("Generate Upload Sheet", type="primary", key="perf_upload"):
+        check_clicked = st.button("Check Replacement Keywords", key="perf_replacement_check")
+        upload_clicked = st.button("Generate Upload Sheet", type="primary", key="perf_upload")
+        if check_clicked or upload_clicked:
+            with st.spinner("Checking replacement keywords against the shared database..."):
+                state["replacement_check"] = performance_replacement_check(edited, _cached_existing_basis_keywords(revision_key))
+                state["replacement_check_signature"] = upload_signature
+            state.pop("upload", None)
+        if state.get("replacement_check_signature") == upload_signature:
+            check = state["replacement_check"]
+            st.subheader("Replacement Keyword Check")
+            st.caption("Checks the same basis and language across all domains in the shared database. Keywords scheduled for deletion are still treated as present until the shared database changes.")
+            labels = {"Already Present": "🔴 Already Present", "Duplicate Replacement": "🟠 Duplicate Replacement",
+                      "Incomplete": "🟠 Incomplete", "Not Present": "🟢 Not Present"}
+            st.dataframe(check.assign(**{"Keyword Check": check["Keyword Check"].map(labels)}),
+                hide_index=True, use_container_width=True)
+            blocked = check.loc[check["Selected"] & check["Keyword Check"].ne("Not Present")]
+            if not blocked.empty:
+                st.warning(f"{len(blocked):,} selected replacement(s) are already present, duplicated or incomplete. Edit or deselect them before uploading.")
+        elif "replacement_check" in state:
+            st.info("Replacement entries changed. Run Check Replacement Keywords again; generating an upload sheet also rechecks automatically.")
+        if upload_clicked:
             state.pop("upload", None)
             state["upload"] = performance_upload_sheet(edited,deletion,domains,patterns,keyword_rows,existing_keywords=_cached_existing_basis_keywords(revision_key))
             state["upload_signature"] = upload_signature
