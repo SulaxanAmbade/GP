@@ -8,6 +8,9 @@ Output: stripped url, imp, rev, matching basis.
 Wildcard-separated fragments retain the original coverage matcher (including
 reordered fragments, common URL plurals and exact ~word~ locks). Additionally,
 a wildcard may consume zero characters: thanks*giving matches thanksgiving.
+Within a fragment, ~ joins ordered neighboring terms with optional separators:
+cold~coffee matches coldcoffee/cold-coffee, but not cold-brew-coffee.
+~cold~brew matches coldbrew/cold-brew; ~brew~cold preserves the reverse order.
 The lowest numeric priority wins; ties prefer the longer normalized basis.
 Language codes filter user-supplied bases; labels retain the entered spelling.
 This file needs no shared database or other application files.
@@ -62,21 +65,32 @@ def normalize_coverage_basis(basis):
 
 @lru_cache(maxsize=8192)
 def _cached_normalize_coverage_basis(basis):
-    """Preserve wildcard gaps and exact ~word~ locks; ignore backslashes."""
+    """Preserve wildcard gaps, tilde chains and single-word ~word~ locks."""
     raw_basis = unquote(str(basis)).replace("\\", "")
     tokens = []
-    for part in re.split(r"(~[^~]*~|\*)", raw_basis):
-        if part == "*":
-            if tokens and tokens[-1] != "*":
-                tokens.append("*")
-        elif part.startswith("~") and part.endswith("~") and len(part) >= 2:
-            # Lock each word of a phrase; the phrase's words stay adjacent.
-            tokens.extend(f"~{word}~" for word in normalize_search_text(part[1:-1]).split())
+    for position, fragment in enumerate(raw_basis.split("*")):
+        if position and tokens and tokens[-1] != "*":
+            tokens.append("*")
+        parts = tilde_chain_parts(fragment)
+        if parts:
+            tokens.append("~" + "~".join(parts) + "~")
         else:
-            tokens.extend(normalize_search_text(part).split())
+            for part in re.split(r"(~[^~]*~)", fragment):
+                if part.startswith("~") and part.endswith("~") and len(part) >= 2:
+                    tokens.extend(f"~{word}~" for word in normalize_search_text(part[1:-1]).split())
+                else:
+                    tokens.extend(normalize_search_text(part).split())
     if tokens and tokens[-1] == "*":
         tokens.pop()
     return " ".join(tokens)
+
+
+def tilde_chain_parts(fragment):
+    if "~" not in fragment:
+        return ()
+    parts = tuple(value for part in re.split(r"~+", fragment)
+        if (value := normalize_search_text(part)))
+    return parts if len(parts) >= 2 else ()
 
 def coverage_priority_value(value):
     """Lower numeric priorities catch first; missing/invalid values catch last."""
@@ -297,30 +311,50 @@ def joined_wildcard_patterns(normalized):
     Outer word boundaries prevent matching inside an unrelated larger word.
     Tilde locks retain their own word boundaries even next to a wildcard.
     """
-    if "*" not in normalized:
+    has_chain = any(tilde_chain_parts(fragment) for fragment in normalized.split("*"))
+    if "*" not in normalized and not has_chain:
         return None
     fragments = [fragment.strip() for fragment in normalized.split("*") if fragment.strip()]
-    if len(fragments) < 2:
+    if len(fragments) < 2 and not has_chain:
         return None
     patterns = []
+    whole_fragments = []
     for position, fragment in enumerate(fragments):
-        words = []
-        for word in fragment.split():
-            locked = word.startswith("~") and word.endswith("~")
-            literal = re.escape(word[1:-1] if locked else word)
-            words.append(r"\b" + literal + r"\b" if locked else literal)
-        expression = r"\s+".join(words)
+        chain = tilde_chain_parts(fragment)
+        if chain:
+            expression = r"(?<![a-z0-9])" + r"\s*".join(
+                r"\s+".join(re.escape(word) for word in part.split()) for part in chain
+            ) + r"(?![a-z0-9])"
+        else:
+            words = []
+            for word in fragment.split():
+                locked = word.startswith("~") and word.endswith("~")
+                literal = re.escape(word[1:-1] if locked else word)
+                words.append(r"\b" + literal + r"\b" if locked else literal)
+            expression = r"\s+".join(words)
+        if has_chain:
+            whole_fragments.append((fragment, re.compile(r"(?=(?<![a-z0-9])" + expression + r"(?![a-z0-9]))")))
         if position == 0:
             expression = r"(?<![a-z0-9])" + expression
         if position == len(fragments) - 1:
             expression += r"(?![a-z0-9])"
         patterns.append(re.compile(expression))
+    if has_chain:
+        counts = Counter(fragments)
+        unique = dict(whole_fragments)
+        return {"ordered": tuple(patterns), "whole": tuple((unique[fragment], count) for fragment, count in counts.items())}
     return tuple(patterns)
 
 
 def joined_wildcard_matches(searchable, patterns):
     # Search fixed fragments from left to right instead of compiling repeated
     # greedy .* expressions, which can backtrack excessively on long URLs.
+    if isinstance(patterns, dict):
+        # A chain is ordered internally. Separate * fragments retain the
+        # original coverage rule allowing complete fragments in either order.
+        if all(sum(1 for _ in pattern.finditer(searchable)) >= count for pattern, count in patterns["whole"]):
+            return True
+        patterns = patterns["ordered"]
     position = 0
     for pattern in patterns:
         match = pattern.search(searchable, position)
@@ -344,8 +378,8 @@ def _joined_candidate_index(normalized_bases):
         if compiled is None:
             continue
         patterns[basis_id] = compiled
-        fragments = tuple(dict.fromkeys(part.replace("~", "").strip()
-            for part in normalized.split("*") if part.strip()))
+        fragments = tuple(dict.fromkeys(part.strip()
+            for part in re.split(r"[*~]+", normalized) if part.strip()))
         literals[basis_id] = fragments
         frequency.update(fragments)
     children = [{}]
@@ -447,7 +481,7 @@ def run_ui():
     import streamlit as st
     st.set_page_config(page_title="Manual Basis Coverage", layout="wide")
     st.title("Manual Basis Coverage")
-    st.caption("Upload a URL CSV and enter your own bases. The lowest priority wins (1000 before 2000); ties prefer the longer basis. Blank priorities catch last. Wildcard fragments can be separated or joined: thanks*giving catches thanksgiving and thanks-giving. ~word~ locks an exact word. URL matching ignores capitalization; output preserves your basis labels.")
+    st.caption("Upload a URL CSV and enter your own bases. The lowest priority wins (1000 before 2000); ties prefer the longer basis. Blank priorities catch last. * can skip characters or words: thanks*giving catches thanksgiving and thanks-giving. ~ links neighboring terms in the given order, allowing separators or joined spelling: ~cold~brew catches cold-brew and coldbrew; cold~coffee does not catch cold-brew-coffee. A standalone ~word~ locks an exact word. URL matching ignores capitalization; output preserves your basis labels.")
     upload = st.file_uploader("URL performance CSV", type=["csv"])
     if upload is None:
         st.info("Choose a CSV containing URLs and optional impressions/revenue columns.")
